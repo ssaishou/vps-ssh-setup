@@ -1,7 +1,7 @@
 # ssh-setup.sh
 
-An interactive SSH hardening script for Debian / Ubuntu servers.
-一个用于 Debian / Ubuntu 服务器的交互式 SSH 加固脚本。
+A script for Debian / Ubuntu servers that changes the SSH port and enables SSH key-based login.
+一个用于 Debian / Ubuntu 服务器的修改SSH端口以及添加密钥登录的脚本。
 
 ---
 
