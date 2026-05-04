@@ -1,8 +1,8 @@
 # ssh-setup.sh
 
-A script for Debian / Ubuntu servers that changes the SSH port and enables SSH key-based login.
+A script for Debian / Ubuntu servers that changes the SSH port and manages SSH password / key login.
 
-一个用于 Debian / Ubuntu 服务器的修改SSH端口以及添加密钥登录的脚本。
+一个用于 Debian / Ubuntu 服务器的修改 SSH 端口以及管理密码 / 密钥登录的脚本。
 
 ---
 
@@ -10,20 +10,18 @@ A script for Debian / Ubuntu servers that changes the SSH port and enables SSH k
 
 ### What it does
 
-A menu-driven Bash script with three operations:
+A menu-driven Bash script with two main areas:
 
 1. **Change SSH port** — handles both classic `sshd.service` setups and
    modern systemd socket activation (Ubuntu 22.04+). Updates `ufw` /
    `firewalld` if present, then keeps your current session alive and
    asks you to verify the new port from another terminal. If the test
    fails, you can roll everything back from the same prompt.
-2. **Add an SSH public key** — paste a public key (`ssh-rsa`,
-   `ssh-ed25519`, `ecdsa-…`, or `sk-…`). The script validates the
-   format, ensures `~/.ssh` and `authorized_keys` have correct
-   permissions, and skips duplicates.
-3. **Disable password authentication** — refuses to run unless an
-   `authorized_keys` file with at least one key exists *and* the
-   effective `PubkeyAuthentication` is `yes`. Prevents lock-outs.
+2. **Password & key management** — a submenu for changing the target
+   user's SSH login password, adding a public key and enabling key
+   login, removing a selected public key after restoring password
+   login, and disabling password authentication only after a working
+   key is in place.
 
 ### Requirements
 
@@ -47,9 +45,11 @@ chmod +x ssh-setup.sh
 sudo ./ssh-setup.sh
 ```
 
-You'll see a menu — pick the operations you need, in any order. The
-recommended sequence on a fresh VPS is **2 → 1 → 3**: add your key,
-change the port (and test it), then disable password login.
+You'll see a bilingual menu — pick the operations you need. The
+recommended sequence on a fresh VPS is: enter **2) Password & key
+management**, choose **2) Add public key and enable key login**, then
+return and choose **1) Change SSH port**. After you have verified key
+login works, use **2 → 4** to disable password login.
 
 ### Safety features
 
@@ -63,8 +63,10 @@ change the port (and test it), then disable password login.
   editing distro-shipped unit files.
 - Port-change flow keeps the existing SSH session open and offers an
   in-script rollback.
-- Disabling password auth is gated on real key presence — you cannot
-  accidentally lock yourself out by running step 3 first.
+- Disabling password auth is gated on real key presence and effective
+  `sshd -T` verification.
+- Removing a public key restores password login first and asks you to
+  test password login from another terminal before deleting the key.
 
 ### What the script does NOT do
 
@@ -87,18 +89,14 @@ VPS as a fallback before changing SSH settings.
 
 ### 功能简介
 
-一个菜单式的 Bash 脚本，提供三个操作：
+一个菜单式的 Bash 脚本，提供两个主要区域：
 
 1. **修改 SSH 端口** — 同时兼容传统 `sshd.service` 模式和 Ubuntu 22.04+
    的 systemd socket 激活模式。会自动更新 `ufw` / `firewalld`（如已启用），
    然后**保留当前 SSH 会话**让你从另一个终端测试新端口。如果测试失败，
    可以在同一交互界面里一键回退。
-2. **添加 SSH 公钥** — 粘贴公钥（支持 `ssh-rsa` / `ssh-ed25519` /
-   `ecdsa-…` / `sk-…`）。脚本会校验格式、自动创建 `~/.ssh`、设置正确权限，
-   并跳过重复的密钥。
-3. **关闭密码登录** — 只有在 `authorized_keys` 中确实存在公钥
-   **并且** `sshd -T` 显示 `PubkeyAuthentication yes` 的情况下才会执行，
-   避免把自己锁在外面。
+2. **密码与密钥管理** — 子菜单内可以修改目标用户的 SSH 登录密码、添加公钥并启用密钥登录、
+   先恢复密码登录再删除指定公钥，以及在确认密钥可用后关闭密码登录。
 
 ### 环境要求
 
@@ -122,8 +120,9 @@ chmod +x ssh-setup.sh
 sudo ./ssh-setup.sh
 ```
 
-进入菜单后按需选择操作，顺序任意。新 VPS 推荐的执行顺序是
-**2 → 1 → 3**：先加公钥，再改端口（并测试），最后关闭密码登录。
+进入菜单后按需选择操作。新 VPS 推荐的执行顺序是：进入
+**2) 密码与密钥管理**，选择 **2) 添加公钥并启用密钥登录**，然后返回主菜单选择
+**1) 修改 SSH 端口**。确认密钥登录可用后，再使用 **2 → 4** 关闭密码登录。
 
 ### 安全机制
 
@@ -135,8 +134,8 @@ sudo ./ssh-setup.sh
   （`/etc/systemd/system/ssh.socket.d/override.conf`），
   不会改动发行版自带的 unit 文件
 - 改端口流程会**保留当前会话**，并提供脚本内回退选项
-- 关闭密码登录前强制检查密钥是否真实存在 —
-  即使你第一步就误选 3，也无法把自己锁出去
+- 关闭密码登录前强制检查密钥是否真实存在，并通过 `sshd -T` 验证最终有效配置
+- 删除公钥前会先恢复密码登录，并要求你从另一个终端测试密码登录成功后再删除
 
 ### 脚本不会做的事
 
