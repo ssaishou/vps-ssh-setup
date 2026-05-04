@@ -4,8 +4,11 @@
 #
 # Features:
 #   1) Change SSH port (handles systemd socket activation, ssh vs sshd names)
-#   2) Add an SSH public key to authorized_keys
-#   3) Disable password authentication (only after verifying key is in place)
+#   2) Manage SSH password and keys
+#      - Change the target user's SSH login password
+#      - Add a public key and enable public-key authentication
+#      - Remove a public key after restoring password login
+#      - Disable password authentication after verifying a key is in place
 #
 # The port-change step backs up every file it touches and offers a rollback
 # prompt so the user can restore the previous state from the same session
@@ -69,7 +72,7 @@ detect_ssh_units() {
         err "This script only supports systemd-managed OpenSSH on Debian/Ubuntu."
         exit 1
     fi
-    ok  "Detected SSH service unit: $SSH_SERVICE"
+    ok  "Detected SSH service unit / 检测到 SSH 服务单元: $SSH_SERVICE"
 
     SSH_SOCKET=""
     for name in ssh sshd; do
@@ -82,10 +85,10 @@ detect_ssh_units() {
         fi
     done
     if [[ -n "$SSH_SOCKET" ]]; then
-        warn "Socket activation is in use ($SSH_SOCKET)."
-        warn "Port will be changed via a systemd drop-in, not just sshd_config."
+        warn "Socket activation is in use / 当前使用 socket 激活 ($SSH_SOCKET)."
+        warn "Port will be changed via a systemd drop-in / 端口会通过 systemd drop-in 修改。"
     else
-        info "No SSH socket activation detected; using sshd_config only."
+        info "No SSH socket activation detected; using sshd_config only / 未检测到 socket 激活，仅修改 sshd_config。"
     fi
 }
 
@@ -101,16 +104,25 @@ detect_target_user() {
         err "Could not resolve home directory for user '$TARGET_USER'."
         exit 1
     fi
-    info "Target user for SSH key: $TARGET_USER ($TARGET_HOME)"
+    info "Target user for SSH key / SSH 密钥目标用户: $TARGET_USER ($TARGET_HOME)"
 }
 
 get_current_port() {
-    # Prefer the actual listening port (works for both classic and socket setups).
+    # Prefer the active socket unit when socket activation is in use.
     local port
-    port="$(ss -H -tlnp 2>/dev/null \
-            | grep -E 'sshd|ssh\.socket|systemd' \
-            | awk '{print $4}' \
-            | awk -F: '{print $NF}' | sort -un | head -n1)"
+    if [[ -n "$SSH_SOCKET" ]]; then
+        port="$($SUDO systemctl show "$SSH_SOCKET" --property=Listen --value 2>/dev/null \
+                | sed 's/ (Stream)//g' \
+                | tr ' ' '\n' \
+                | sed -nE 's/.*:([0-9]+)$/\1/p; s/^([0-9]+)$/\1/p' \
+                | sort -un | head -n1)"
+    fi
+    if [[ -z "$port" ]]; then
+        port="$(ss -H -tlnp 2>/dev/null \
+                | grep -E 'sshd' \
+                | awk '{print $4}' \
+                | awk -F: '{print $NF}' | sort -un | head -n1)"
+    fi
     if [[ -z "$port" ]]; then
         port="$($SUDO sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}')"
     fi
@@ -399,30 +411,54 @@ restart_ssh() {
     $SUDO systemctl restart "$SSH_SERVICE"
 }
 
+restore_password_auth() {
+    reset_modified_files
+    set_sshd_option "PasswordAuthentication" "yes"
+    set_sshd_option "KbdInteractiveAuthentication" "yes"
+    set_sshd_option "UsePAM" "yes"
+
+    if ! restart_ssh; then
+        err "SSH restart failed after restoring password login. Rolling back."
+        err "恢复密码登录后重启 SSH 失败，正在回滚。"
+        restore_modified_files
+        restart_ssh >/dev/null 2>&1 || err "Rollback restart failed. Manual intervention required."
+        return 1
+    fi
+
+    if ! verify_sshd_option PasswordAuthentication yes; then
+        err "Password login is NOT effectively enabled. Rolling back."
+        err "密码登录没有真正启用，正在回滚。"
+        restore_modified_files
+        restart_ssh >/dev/null 2>&1 || err "Rollback restart failed. Manual intervention required."
+        return 1
+    fi
+    ok "Password login restored and verified / 密码登录已恢复并验证。"
+}
+
 # =====================================================================
 # Feature 1: change SSH port
 # =====================================================================
 change_port_flow() {
     local current_port new_port
     current_port="$(get_current_port)"
-    info "Current SSH port appears to be: ${BOLD}${current_port}${NC}"
+    info "Current SSH port appears to be / 当前 SSH 端口似乎是: ${BOLD}${current_port}${NC}"
 
     while true; do
-        ask "Enter the new SSH port (1-65535):"
+        ask "Enter the new SSH port / 输入新的 SSH 端口 (1-65535):"
         read -r new_port
         validate_port "$new_port" || continue
         if [[ "$new_port" == "$current_port" ]]; then
-            warn "New port is the same as current port. Choose a different one."
+            warn "New port is the same as current port / 新端口和当前端口相同，请换一个。"
             continue
         fi
         if (( new_port < 1024 )); then
-            ask "Port $new_port is a privileged port (<1024). Continue? [y/N]:"
+            ask "Port $new_port is a privileged port (<1024). Continue? / 这是特权端口，继续吗？[y/N]:"
             read -r yn
             [[ "$yn" =~ ^[Yy]$ ]] || continue
         fi
         if port_in_use "$new_port"; then
-            warn "Port $new_port appears to be in use by another service."
-            ask "Continue anyway? [y/N]:"
+            warn "Port $new_port appears to be in use by another service / 该端口可能已被其他服务占用。"
+            ask "Continue anyway? / 仍然继续吗？[y/N]:"
             read -r yn
             [[ "$yn" =~ ^[Yy]$ ]] || continue
         fi
@@ -448,11 +484,11 @@ change_port_flow() {
     fi
 
     # Apply
-    info "Updating SSH config (Port $new_port) via $SSHD_TARGET..."
+    info "Updating SSH config / 正在更新 SSH 配置 (Port $new_port) via $SSHD_TARGET..."
     set_sshd_option "Port" "$new_port"
 
     if [[ -n "$SSH_SOCKET" ]]; then
-        info "Writing systemd socket drop-in for $SSH_SOCKET..."
+        info "Writing systemd socket drop-in / 正在写入 systemd socket drop-in for $SSH_SOCKET..."
         write_socket_dropin "$new_port"
     fi
 
@@ -460,59 +496,60 @@ change_port_flow() {
     local fw
     fw="$(detect_firewall)"
     if [[ -n "$fw" ]]; then
-        info "Detected active firewall: $fw"
-        ask "Allow new port ${new_port}/tcp through ${fw}? [Y/n]:"
+        info "Detected active firewall / 检测到启用的防火墙: $fw"
+        ask "Allow new port ${new_port}/tcp through ${fw}? / 放行新端口吗？[Y/n]:"
         read -r yn
         if [[ ! "$yn" =~ ^[Nn]$ ]]; then
             firewall_open_port "$fw" "$new_port"
         fi
     else
-        warn "No local firewall (ufw/firewalld) detected as active."
-        warn "If your VPS uses a cloud security group, open port ${new_port}/tcp there before testing."
+        warn "No local firewall (ufw/firewalld) detected as active / 未检测到启用的本机防火墙。"
+        warn "If your VPS uses a cloud security group, open port ${new_port}/tcp there before testing / 如果有云安全组，请先放行新端口。"
     fi
 
     # Restart
-    info "Restarting SSH..."
+    info "Restarting SSH / 正在重启 SSH..."
     if ! restart_ssh; then
-        err "SSH restart failed. Rolling back automatically."
+        err "SSH restart failed. Rolling back automatically / SSH 重启失败，正在自动回滚。"
         rollback_port "$current_port" "$backup_socket_state" "$fw" "$new_port"
         return 1
     fi
 
-    ok "SSH is now configured to listen on port ${new_port}."
+    ok "SSH is now configured to listen on port ${new_port} / SSH 已配置为监听端口 ${new_port}。"
     sleep 1
     if ! port_in_use "$new_port"; then
-        warn "Port ${new_port} does not appear in 'ss -tln' output. Something may be off."
+        warn "Port ${new_port} does not appear in 'ss -tln' output / 未在监听端口列表中看到 ${new_port}，请留意。"
     fi
 
     # Test prompt with rollback
     cat <<EOF
 
-${BOLD}=== IMPORTANT: TEST BEFORE CONTINUING ===${NC}
+${BOLD}=== IMPORTANT / 重要：继续前请先测试 ===${NC}
 Keep THIS session open. From another terminal, run:
+请保持当前会话不要关闭，并在另一个终端运行：
 
     ssh -p ${new_port} ${TARGET_USER}@<this-server>
 
-Did the new connection succeed?
-  [1] Yes, keep the new port (${new_port})
-  [2] No, roll back to the old port (${current_port})
-  [3] Skip the test (NOT recommended)
+Did the new connection succeed? / 新连接是否成功？
+  [1] Yes, keep the new port / 成功，保留新端口 (${new_port})
+  [2] No, roll back to old port / 失败，回滚到旧端口 (${current_port})
+  [3] Skip the test / 跳过测试（不推荐）
 EOF
     while true; do
-        ask "Choose [1/2/3]:"
+        ask "Choose / 请选择 [1/2/3]:"
         read -r choice
         case "$choice" in
-            1) ok "Keeping new port ${new_port}."
+            1) ok "Keeping new port ${new_port} / 保留新端口 ${new_port}。"
                # Close old port in firewall (only if changed)
                if [[ -n "$fw" ]]; then
-                   ask "Remove firewall rule for OLD port ${current_port}/tcp? [y/N]:"
+                   ask "Remove firewall rule for OLD port ${current_port}/tcp? / 删除旧端口防火墙规则吗？[y/N]:"
                    read -r yn
                    [[ "$yn" =~ ^[Yy]$ ]] && firewall_close_port "$fw" "$current_port"
                fi
                return 0 ;;
             2) rollback_port "$current_port" "$backup_socket_state" "$fw" "$new_port"
                return 0 ;;
-            3) warn "Skipping test. Make sure you can reconnect before logging out!"
+            3) warn "Skipping test. Make sure you can reconnect before logging out / 已跳过测试，退出前务必确认能重新连接！"
                return 0 ;;
             *) err "Invalid choice." ;;
         esac
@@ -521,7 +558,7 @@ EOF
 
 rollback_port() {
     local old_port="$1" socket_state="$2" fw="$3" failed_port="$4"
-    warn "Rolling back to port ${old_port}..."
+    warn "Rolling back to port ${old_port} / 正在回滚到端口 ${old_port}..."
 
     # Restore every sshd config file we touched (main + drop-ins + any
     # 00-ssh-setup.conf we created) and delete files we created from scratch.
@@ -543,7 +580,7 @@ rollback_port() {
     fi
 
     if restart_ssh; then
-        ok "Rolled back. SSH is again on port ${old_port}."
+        ok "Rolled back. SSH is again on port ${old_port} / 已回滚，SSH 重新使用端口 ${old_port}。"
     else
         err "Rollback restart failed. Manual intervention required."
         err "Backups are in: $BACKUP_DIR"
@@ -551,7 +588,7 @@ rollback_port() {
 }
 
 # =====================================================================
-# Feature 2: add SSH public key
+# Feature 2: password and key management
 # =====================================================================
 add_key_flow() {
     local ssh_dir="${TARGET_HOME}/.ssh"
@@ -560,7 +597,8 @@ add_key_flow() {
     cat <<EOF
 
 Paste the public key (single line beginning with ssh-rsa / ssh-ed25519 / ecdsa-sha2-...).
-Press ENTER when done:
+请粘贴 SSH 公钥（单行，以 ssh-rsa / ssh-ed25519 / ecdsa-sha2-... 开头）。
+Press ENTER when done / 粘贴后按回车：
 EOF
     local pubkey
     read -r pubkey
@@ -569,11 +607,11 @@ EOF
     pubkey="$(echo "$pubkey" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 
     if [[ -z "$pubkey" ]]; then
-        err "Empty input. Aborting."
+        err "Empty input. Aborting / 输入为空，已取消。"
         return 1
     fi
     if ! [[ "$pubkey" =~ ^(ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-[a-z0-9-]+|sk-(ssh-ed25519|ecdsa-sha2-nistp256))[[:space:]]+[A-Za-z0-9+/=]+([[:space:]]+.*)?$ ]]; then
-        err "That does not look like a valid OpenSSH public key."
+        err "That does not look like a valid OpenSSH public key / 这不像有效的 OpenSSH 公钥。"
         return 1
     fi
 
@@ -583,7 +621,7 @@ EOF
         tmp="$(mktemp)"
         echo "$pubkey" > "$tmp"
         if ! ssh-keygen -l -f "$tmp" >/dev/null 2>&1; then
-            err "ssh-keygen rejected the key as malformed."
+            err "ssh-keygen rejected the key as malformed / ssh-keygen 认为该公钥格式错误。"
             rm -f "$tmp"
             return 1
         fi
@@ -602,7 +640,7 @@ EOF
     $SUDO chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$ssh_dir"
 
     if [[ -f "$auth_file" ]] && $SUDO grep -qxF "$pubkey" "$auth_file"; then
-        warn "This exact key is already present in $auth_file. Nothing to do."
+        warn "This exact key is already present in $auth_file. Nothing to do / 该公钥已存在，无需重复添加。"
         return 0
     fi
 
@@ -610,7 +648,162 @@ EOF
     echo "$pubkey" | $SUDO tee -a "$auth_file" >/dev/null
     $SUDO chmod 600 "$auth_file"
     $SUDO chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$auth_file"
-    ok "Public key appended to $auth_file"
+    ok "Public key appended to $auth_file / 公钥已添加到 $auth_file"
+}
+
+enable_pubkey_auth_flow() {
+    reset_modified_files
+    set_sshd_option "PubkeyAuthentication" "yes"
+
+    if ! restart_ssh; then
+        err "SSH restart failed after enabling public-key login. Rolling back."
+        err "启用密钥登录后重启 SSH 失败，正在回滚。"
+        restore_modified_files
+        restart_ssh >/dev/null 2>&1 || err "Rollback restart failed. Manual intervention required."
+        return 1
+    fi
+
+    if ! verify_sshd_option PubkeyAuthentication yes; then
+        err "Public-key login is NOT effectively enabled. Rolling back."
+        err "密钥登录没有真正启用，正在回滚。"
+        restore_modified_files
+        restart_ssh >/dev/null 2>&1 || err "Rollback restart failed. Manual intervention required."
+        return 1
+    fi
+    ok "Public-key authentication enabled and verified / 密钥登录已启用并验证。"
+}
+
+add_key_and_enable_flow() {
+    add_key_flow || return 1
+    enable_pubkey_auth_flow
+}
+
+change_password_flow() {
+    cat <<EOF
+
+This will run passwd for user: ${TARGET_USER}
+即将为用户 ${TARGET_USER} 修改 SSH 登录密码。
+The password is handled by the system passwd command; this script will not read or store it.
+密码由系统 passwd 命令处理，脚本不会读取或保存密码。
+
+EOF
+    ask "Continue? / 继续吗？[y/N]:"
+    local yn
+    read -r yn
+    [[ "$yn" =~ ^[Yy]$ ]] || { info "Aborted by user / 用户已取消。"; return 0; }
+
+    if $SUDO passwd "$TARGET_USER"; then
+        ok "Password changed for $TARGET_USER / 已修改 $TARGET_USER 的密码。"
+    else
+        err "passwd failed / passwd 执行失败。"
+        return 1
+    fi
+}
+
+list_authorized_key_lines() {
+    local auth_file="$1"
+    $SUDO awk '
+        /^[[:space:]]*(ssh-|ecdsa-|sk-)/ {
+            comment=""
+            if (NF >= 3) {
+                for (i=3; i<=NF; i++) {
+                    comment = comment (i==3 ? "" : " ") $i
+                }
+            }
+            printf "%d) %s %s\n", NR, $1, comment
+        }
+    ' "$auth_file"
+}
+
+remove_public_key_flow() {
+    local auth_file="${TARGET_HOME}/.ssh/authorized_keys"
+    if [[ ! -s "$auth_file" ]] && ! $SUDO test -s "$auth_file"; then
+        err "No authorized_keys found for $TARGET_USER ($auth_file)."
+        err "未找到 ${TARGET_USER} 的 authorized_keys 文件。"
+        return 1
+    fi
+
+    cat <<EOF
+
+This will restore password login first, ask you to test it from another terminal,
+then remove the selected public key from:
+  $auth_file
+
+此操作会先恢复密码登录，并要求你在另一个终端测试成功后，
+再从以下文件删除选中的公钥：
+  $auth_file
+
+EOF
+    ask "Continue? / 继续吗？[y/N]:"
+    local yn
+    read -r yn
+    [[ "$yn" =~ ^[Yy]$ ]] || { info "Aborted by user / 用户已取消。"; return 0; }
+
+    restore_password_auth || return 1
+
+    cat <<EOF
+
+${BOLD}=== IMPORTANT / 重要：删除公钥前请先测试密码登录 ===${NC}
+Keep THIS session open. From another terminal, run:
+请保持当前会话不要关闭，并在另一个终端运行：
+
+    ssh ${TARGET_USER}@<this-server>
+
+If you changed the SSH port, add -p <port>.
+如果你改过 SSH 端口，请加上 -p <端口>。
+
+EOF
+    ask "Did password login succeed? / 密码登录是否成功？[y/N]:"
+    read -r yn
+    if [[ ! "$yn" =~ ^[Yy]$ ]]; then
+        warn "Password login was not confirmed. Keeping keys unchanged."
+        warn "未确认密码登录成功，公钥保持不变。"
+        return 1
+    fi
+
+    local keys
+    keys="$(list_authorized_key_lines "$auth_file")"
+    if [[ -z "$keys" ]]; then
+        err "$auth_file has no recognizable public keys."
+        err "$auth_file 中没有可识别的公钥。"
+        return 1
+    fi
+
+    cat <<EOF
+
+Recognized public keys / 可识别的公钥：
+$keys
+
+EOF
+    ask "Enter the line number to remove / 输入要删除的行号:"
+    local line_no
+    read -r line_no
+    if ! [[ "$line_no" =~ ^[0-9]+$ ]]; then
+        err "Line number must be an integer / 行号必须是整数。"
+        return 1
+    fi
+    if ! $SUDO awk -v n="$line_no" 'NR==n && /^[[:space:]]*(ssh-|ecdsa-|sk-)/ {found=1} END{exit found?0:1}' "$auth_file"; then
+        err "Line $line_no is not a recognizable public key line."
+        err "第 $line_no 行不是可识别的公钥行。"
+        return 1
+    fi
+
+    ask "Type DELETE to remove line ${line_no} / 输入 DELETE 删除第 ${line_no} 行:"
+    local confirm
+    read -r confirm
+    if [[ "$confirm" != "DELETE" ]]; then
+        info "Aborted by user / 用户已取消。"
+        return 0
+    fi
+
+    backup_file "$auth_file" >/dev/null
+    local tmp
+    tmp="$(mktemp)"
+    $SUDO awk -v n="$line_no" 'NR != n {print}' "$auth_file" > "$tmp"
+    $SUDO install -m 0600 -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER")" "$tmp" "$auth_file"
+    rm -f "$tmp"
+    ok "Removed public key line ${line_no}. Password login remains enabled."
+    ok "已删除第 ${line_no} 行公钥，密码登录保持启用。"
 }
 
 # =====================================================================
@@ -619,43 +812,47 @@ EOF
 disable_password_auth_flow() {
     local auth_file="${TARGET_HOME}/.ssh/authorized_keys"
 
-    info "Pre-flight checks before disabling password authentication..."
+    info "Pre-flight checks before disabling password authentication / 关闭密码登录前检查..."
 
     # 1. authorized_keys must exist and contain at least one key
     if [[ ! -s "$auth_file" ]] && ! $SUDO test -s "$auth_file"; then
         err "No authorized_keys found for $TARGET_USER ($auth_file)."
-        err "Add a key first (option 2). Refusing to disable password login."
+        err "未找到 ${TARGET_USER} 的 authorized_keys。请先添加密钥，拒绝关闭密码登录。"
         return 1
     fi
     local key_count
     key_count="$($SUDO grep -cE '^(ssh-|ecdsa-|sk-)' "$auth_file" 2>/dev/null || echo 0)"
     if (( key_count < 1 )); then
-        err "$auth_file has no recognizable public keys. Aborting."
+        err "$auth_file has no recognizable public keys. Aborting / 没有可识别的公钥，已取消。"
         return 1
     fi
-    ok "Found $key_count key(s) in $auth_file"
+    ok "Found $key_count key(s) in $auth_file / 在 $auth_file 中找到 $key_count 个公钥。"
 
     # 2. Effective sshd config must allow pubkey auth
     local pubkey_auth
     pubkey_auth="$($SUDO sshd -T 2>/dev/null | awk '$1=="pubkeyauthentication"{print $2; exit}')"
     if [[ "$pubkey_auth" != "yes" ]]; then
         err "Effective PubkeyAuthentication is '$pubkey_auth' (need 'yes'). Aborting."
+        err "当前有效 PubkeyAuthentication 为 '$pubkey_auth'，需要为 'yes'，已取消。"
         return 1
     fi
-    ok "PubkeyAuthentication is enabled."
+    ok "PubkeyAuthentication is enabled / 密钥登录已启用。"
 
     # 3. Confirm
     cat <<EOF
 
 ${YELLOW}You are about to disable password-based SSH login.${NC}
+${YELLOW}你即将关闭 SSH 密码登录。${NC}
 After this, ${BOLD}only key-based${NC} authentication will work for SSH.
+之后 SSH 将只能使用密钥登录。
 Make sure you have already verified that your key works.
+请务必确认你的密钥已经可以登录。
 
 EOF
-    ask "Type 'YES' (uppercase) to proceed:"
+    ask "Type 'YES' (uppercase) to proceed / 输入大写 YES 继续:"
     read -r confirm
     if [[ "$confirm" != "YES" ]]; then
-        info "Aborted by user."
+        info "Aborted by user / 用户已取消。"
         return 0
     fi
 
@@ -667,6 +864,7 @@ EOF
 
     if ! restart_ssh; then
         err "SSH restart failed after disabling password auth. Rolling back."
+        err "关闭密码登录后重启 SSH 失败，正在回滚。"
         restore_modified_files
         restart_ssh && ok "Rolled back; password auth state unchanged." \
             || err "Rollback restart also failed. Backups are in: $BACKUP_DIR"
@@ -680,42 +878,66 @@ EOF
     verify_sshd_option KbdInteractiveAuthentication no || mismatch=1
     if (( mismatch )); then
         err "Password authentication is NOT effectively disabled. Rolling back."
+        err "密码登录没有真正关闭，正在回滚。"
         restore_modified_files
         restart_ssh && warn "Rolled back. Investigate the conflicting file and try again." \
             || err "Rollback restart failed. Backups are in: $BACKUP_DIR"
         return 1
     fi
-    ok "Password authentication disabled and verified. SSH restarted."
+    ok "Password authentication disabled and verified. SSH restarted / 密码登录已关闭并验证，SSH 已重启。"
 }
 
 # =====================================================================
 # Menu
 # =====================================================================
+password_key_menu() {
+    while true; do
+        cat <<EOF
+
+${BOLD}=== Password & key management / 密码与密钥管理 ===${NC}
+  1) Change SSH login password / 修改 SSH 登录密码
+  2) Add public key and enable key login / 添加公钥并启用密钥登录
+  3) Remove public key and restore password login / 删除公钥并恢复密码登录
+  4) Disable password login (key required) / 关闭密码登录（必须先设置好密钥）
+  b) Back / 返回
+EOF
+        ask "Choose / 请选择:"
+        local c
+        read -r c
+        case "$c" in
+            1) change_password_flow ;;
+            2) add_key_and_enable_flow ;;
+            3) remove_public_key_flow ;;
+            4) disable_password_auth_flow ;;
+            b|B) return 0 ;;
+            *) err "Invalid choice / 无效选项。" ;;
+        esac
+    done
+}
+
 main_menu() {
     while true; do
         cat <<EOF
 
-${BOLD}=== SSH setup menu ===${NC}
-  1) Change SSH port
-  2) Add SSH public key for ${TARGET_USER}
-  3) Disable password authentication
-  q) Quit
+${BOLD}=== SSH setup menu / SSH 设置菜单 ===${NC}
+  1) Change SSH port / 修改 SSH 端口
+  2) Password & key management / 密码与密钥管理
+  q) Quit / 退出
 EOF
-        ask "Choose:"
+        ask "Choose / 请选择:"
         read -r c
         case "$c" in
             1) change_port_flow ;;
-            2) add_key_flow ;;
-            3) disable_password_auth_flow ;;
-            q|Q) info "Bye."; exit 0 ;;
-            *) err "Invalid choice." ;;
+            2) password_key_menu ;;
+            q|Q) info "Bye / 再见。"; exit 0 ;;
+            *) err "Invalid choice / 无效选项。" ;;
         esac
     done
 }
 
 # ---------- entry ----------
 main() {
-    info "Interactive SSH setup for Debian/Ubuntu"
+    info "Interactive SSH setup for Debian/Ubuntu / Debian/Ubuntu 交互式 SSH 设置"
     if [[ ! -f "$SSHD_CONFIG" ]]; then
         err "$SSHD_CONFIG not found. Is OpenSSH server installed?"
         exit 1
