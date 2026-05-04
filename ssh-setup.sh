@@ -45,6 +45,7 @@ fi
 # ---------- globals filled in by detect_* ----------
 SSH_SERVICE=""        # e.g. ssh.service or sshd.service
 SSH_SOCKET=""         # e.g. ssh.socket if socket activation is in use, else empty
+SSH_SERVICE_MANAGER="systemctl"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_DROPIN_DIR_CFG="/etc/ssh/sshd_config.d"
 SSHD_TARGET=""        # file we write directives to (main config or 00-ssh-setup.conf)
@@ -52,7 +53,7 @@ SSHD_USE_DROPIN=0     # 1 if the main config Includes sshd_config.d/*.conf
 TARGET_USER=""        # whose authorized_keys we'll write to
 TARGET_HOME=""
 INSTALL_PATH="/usr/local/bin/ssh-setup"
-INSTALL_SOURCE_URL="https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/dev/ssh-setup.sh"
+INSTALL_SOURCE_URL="https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/main/ssh-setup.sh"
 
 # Files modified / created in the current flow, used for rollback.
 MODIFIED_FILES=()
@@ -176,33 +177,63 @@ handle_cli_args() {
 }
 
 # ---------- detection ----------
+systemd_unit_exists() {
+    local unit="$1"
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl cat "$unit" >/dev/null 2>&1 && return 0
+    systemctl list-unit-files --all "$unit" --no-legend 2>/dev/null \
+        | awk '{print $1}' | grep -qx "$unit" && return 0
+    systemctl list-units --all "$unit" --no-legend 2>/dev/null \
+        | awk '{print $1}' | grep -qx "$unit" && return 0
+    return 1
+}
+
 detect_ssh_units() {
     local name
     SSH_SERVICE=""
+    SSH_SOCKET=""
+    SSH_SERVICE_MANAGER="systemctl"
+
     for name in ssh sshd; do
-        if systemctl list-unit-files --type=service 2>/dev/null \
-                | awk '{print $1}' | grep -qx "${name}.service"; then
+        if systemd_unit_exists "${name}.socket" && systemctl is-active --quiet "${name}.socket"; then
+            SSH_SOCKET="${name}.socket"
+            break
+        fi
+    done
+
+    for name in ssh sshd; do
+        if systemd_unit_exists "${name}.service"; then
             SSH_SERVICE="${name}.service"
             break
         fi
     done
-    if [[ -z "$SSH_SERVICE" ]]; then
-        err "Could not find an ssh.service or sshd.service unit."
-        err "This script only supports systemd-managed OpenSSH on Debian/Ubuntu."
-        exit 1
-    fi
-    ok  "Detected SSH service unit / 检测到 SSH 服务单元: $SSH_SERVICE"
 
-    SSH_SOCKET=""
-    for name in ssh sshd; do
-        if systemctl list-unit-files --type=socket 2>/dev/null \
-                | awk '{print $1}' | grep -qx "${name}.socket"; then
-            if systemctl is-active --quiet "${name}.socket"; then
-                SSH_SOCKET="${name}.socket"
+    if [[ -z "$SSH_SERVICE" && -z "$SSH_SOCKET" ]] && command -v service >/dev/null 2>&1; then
+        for name in ssh sshd; do
+            if [[ -x "/etc/init.d/${name}" ]] || service "$name" status >/dev/null 2>&1; then
+                SSH_SERVICE="$name"
+                SSH_SERVICE_MANAGER="service"
                 break
             fi
-        fi
-    done
+        done
+    fi
+
+    if [[ -n "$SSH_SERVICE" ]]; then
+        ok  "Detected SSH service unit / 检测到 SSH 服务单元: $SSH_SERVICE"
+    elif [[ -n "$SSH_SOCKET" ]]; then
+        ok  "Detected SSH socket activation / 检测到 SSH socket 激活: $SSH_SOCKET"
+        warn "No standalone ssh.service/sshd.service was found; socket restart will be used."
+        warn "未找到独立的 ssh.service/sshd.service，将使用 socket 重启。"
+    else
+        err "Could not find an ssh.service, sshd.service, or active ssh.socket unit."
+        err "未找到 ssh.service、sshd.service 或启用中的 ssh.socket。"
+        err "If this VPS uses OpenSSH, please send the output of:"
+        err "如果这台 VPS 使用 OpenSSH，请把下面命令的输出发给我："
+        err "  systemctl list-units --all 'ssh*' 'sshd*'"
+        err "  systemctl list-unit-files 'ssh*' 'sshd*'"
+        exit 1
+    fi
+
     if [[ -n "$SSH_SOCKET" ]]; then
         warn "Socket activation is in use / 当前使用 socket 激活 ($SSH_SOCKET)."
         warn "Port will be changed via a systemd drop-in / 端口会通过 systemd drop-in 修改。"
@@ -527,7 +558,14 @@ restart_ssh() {
     if [[ -n "$SSH_SOCKET" ]]; then
         $SUDO systemctl restart "$SSH_SOCKET"
     fi
-    $SUDO systemctl restart "$SSH_SERVICE"
+    if [[ -z "$SSH_SERVICE" ]]; then
+        return 0
+    fi
+    if [[ "$SSH_SERVICE_MANAGER" == "service" ]]; then
+        $SUDO service "$SSH_SERVICE" restart
+    else
+        $SUDO systemctl restart "$SSH_SERVICE"
+    fi
 }
 
 restore_password_auth() {
