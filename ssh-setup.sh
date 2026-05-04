@@ -51,10 +51,119 @@ SSHD_TARGET=""        # file we write directives to (main config or 00-ssh-setup
 SSHD_USE_DROPIN=0     # 1 if the main config Includes sshd_config.d/*.conf
 TARGET_USER=""        # whose authorized_keys we'll write to
 TARGET_HOME=""
+INSTALL_PATH="/usr/local/bin/ssh-setup"
 
 # Files modified / created in the current flow, used for rollback.
 MODIFIED_FILES=()
 CREATED_FILES=()
+
+# ---------- install / CLI helpers ----------
+usage() {
+    cat <<EOF
+Usage / 用法:
+  ssh-setup
+      Open the interactive menu / 打开交互菜单
+
+  ssh-setup --install
+      Install this script as ${INSTALL_PATH} / 安装命令到 ${INSTALL_PATH}
+
+  ssh-setup --uninstall
+      Remove ${INSTALL_PATH} / 删除 ${INSTALL_PATH}
+
+  ssh-setup --help
+      Show this help / 显示帮助
+
+Remote one-liner / 远程一键运行:
+  bash <(curl -fsSL https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/dev/ssh-setup.sh)
+
+Remote install / 远程安装:
+  bash <(curl -fsSL https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/dev/ssh-setup.sh) --install
+
+After installing, run anytime with / 安装后可随时运行:
+  ssh-setup
+EOF
+}
+
+install_self() {
+    local src="${BASH_SOURCE[0]}"
+    local tmp=""
+
+    if [[ ! -r "$src" ]]; then
+        err "Cannot read current script source: $src"
+        err "无法读取当前脚本源文件：$src"
+        return 1
+    fi
+
+    if [[ "$src" == /dev/fd/* || "$src" == /proc/self/fd/* ]]; then
+        tmp="$(mktemp)"
+        cp "$src" "$tmp"
+        src="$tmp"
+    fi
+
+    if command -v ssh-setup >/dev/null 2>&1; then
+        local existing
+        existing="$(command -v ssh-setup)"
+        if [[ "$existing" != "$INSTALL_PATH" ]]; then
+            warn "Another ssh-setup command already exists at: $existing"
+            warn "系统里已经存在另一个 ssh-setup 命令：$existing"
+            ask "Continue installing to ${INSTALL_PATH}? / 仍然安装到 ${INSTALL_PATH} 吗？[y/N]:"
+            local yn
+            read -r yn
+            if [[ ! "$yn" =~ ^[Yy]$ ]]; then
+                rm -f "$tmp"
+                info "Aborted by user / 用户已取消。"
+                return 0
+            fi
+        fi
+    fi
+
+    $SUDO install -m 0755 -o root -g root "$src" "$INSTALL_PATH"
+    rm -f "$tmp"
+    ok "Installed to ${INSTALL_PATH} / 已安装到 ${INSTALL_PATH}"
+    printf '\nRun anytime with / 以后可随时运行：\n  ssh-setup\n'
+}
+
+uninstall_self() {
+    if [[ ! -e "$INSTALL_PATH" ]] && ! $SUDO test -e "$INSTALL_PATH"; then
+        warn "${INSTALL_PATH} is not installed / ${INSTALL_PATH} 尚未安装。"
+        return 0
+    fi
+
+    ask "Remove ${INSTALL_PATH}? / 删除 ${INSTALL_PATH} 吗？[y/N]:"
+    local yn
+    read -r yn
+    if [[ ! "$yn" =~ ^[Yy]$ ]]; then
+        info "Aborted by user / 用户已取消。"
+        return 0
+    fi
+
+    $SUDO rm -f "$INSTALL_PATH"
+    ok "Removed ${INSTALL_PATH} / 已删除 ${INSTALL_PATH}"
+}
+
+handle_cli_args() {
+    case "${1:-}" in
+        "" ) return 0 ;;
+        --install)
+            install_self
+            exit $?
+            ;;
+        --uninstall)
+            uninstall_self
+            exit $?
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            err "Unknown option: $1"
+            err "未知参数：$1"
+            usage
+            exit 1
+            ;;
+    esac
+}
 
 # ---------- detection ----------
 detect_ssh_units() {
@@ -937,6 +1046,8 @@ EOF
 
 # ---------- entry ----------
 main() {
+    handle_cli_args "$@"
+
     info "Interactive SSH setup for Debian/Ubuntu / Debian/Ubuntu 交互式 SSH 设置"
     if [[ ! -f "$SSHD_CONFIG" ]]; then
         err "$SSHD_CONFIG not found. Is OpenSSH server installed?"
