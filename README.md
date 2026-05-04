@@ -35,7 +35,7 @@ A menu-driven Bash script with three operations:
 **One-liner (no clone needed):**
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/main/ssh-setup.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/main/ssh-setup.sh)
 ```
 
 **Or download and run manually:**
@@ -110,7 +110,7 @@ VPS as a fallback before changing SSH settings.
 **一条命令直接运行（无需 clone）：**
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/main/ssh-setup.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/main/ssh-setup.sh)
 ```
 
 **或下载后手动运行：**
