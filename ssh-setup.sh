@@ -747,10 +747,35 @@ rollback_port() {
 # =====================================================================
 # Feature 2: password and key management
 # =====================================================================
-add_key_flow() {
+install_public_key() {
+    local pubkey="$1"
     local ssh_dir="${TARGET_HOME}/.ssh"
     local auth_file="${ssh_dir}/authorized_keys"
 
+    # Ensure ~/.ssh exists with correct perms.
+    # When running as root (SUDO=""), $SUDO -u ... would expand to "-u ...",
+    # so fall back to a plain mkdir and let the chown below fix ownership.
+    if [[ -n "$SUDO" ]]; then
+        $SUDO -u "$TARGET_USER" mkdir -p "$ssh_dir"
+    else
+        mkdir -p "$ssh_dir"
+    fi
+    $SUDO chmod 700 "$ssh_dir"
+    $SUDO chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$ssh_dir"
+
+    if [[ -f "$auth_file" ]] && $SUDO grep -qxF "$pubkey" "$auth_file"; then
+        warn "This exact key is already present in $auth_file. Nothing to do / 该公钥已存在，无需重复添加。"
+        return 0
+    fi
+
+    backup_file "$auth_file" >/dev/null
+    echo "$pubkey" | $SUDO tee -a "$auth_file" >/dev/null
+    $SUDO chmod 600 "$auth_file"
+    $SUDO chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$auth_file"
+    ok "Public key appended to $auth_file / 公钥已添加到 $auth_file"
+}
+
+add_key_flow() {
     cat <<EOF
 
 Paste the public key (single line beginning with ssh-rsa / ssh-ed25519 / ecdsa-sha2-...).
@@ -785,29 +810,8 @@ EOF
         rm -f "$tmp"
     fi
 
-    # Ensure ~/.ssh exists with correct perms.
-    # When running as root (SUDO=""), $SUDO -u ... would expand to "-u ...",
-    # so fall back to a plain mkdir and let the chown below fix ownership.
-    if [[ -n "$SUDO" ]]; then
-        $SUDO -u "$TARGET_USER" mkdir -p "$ssh_dir"
-    else
-        mkdir -p "$ssh_dir"
-    fi
-    $SUDO chmod 700 "$ssh_dir"
-    $SUDO chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$ssh_dir"
-
-    if [[ -f "$auth_file" ]] && $SUDO grep -qxF "$pubkey" "$auth_file"; then
-        warn "This exact key is already present in $auth_file. Nothing to do / 该公钥已存在，无需重复添加。"
-        return 0
-    fi
-
-    backup_file "$auth_file" >/dev/null
-    echo "$pubkey" | $SUDO tee -a "$auth_file" >/dev/null
-    $SUDO chmod 600 "$auth_file"
-    $SUDO chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$auth_file"
-    ok "Public key appended to $auth_file / 公钥已添加到 $auth_file"
+    install_public_key "$pubkey"
 }
-
 enable_pubkey_auth_flow() {
     reset_modified_files
     set_sshd_option "PubkeyAuthentication" "yes"
@@ -833,6 +837,92 @@ enable_pubkey_auth_flow() {
 add_key_and_enable_flow() {
     add_key_flow || return 1
     enable_pubkey_auth_flow
+}
+
+generate_key_and_enable_flow() {
+    if ! command -v ssh-keygen >/dev/null 2>&1; then
+        err "ssh-keygen is required to generate a key pair."
+        err "生成密钥对需要 ssh-keygen。"
+        return 1
+    fi
+
+    local host key_comment input tmp_dir key_path pubkey
+    host="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo vps)"
+    key_comment="ssh-setup-${TARGET_USER}@${host}-$(date +%Y%m%d)"
+
+    cat <<EOF
+
+This will generate a new ED25519 key pair on this server, add the public key
+to ${TARGET_USER}'s authorized_keys, and enable public-key login.
+
+此操作会在本服务器生成一对新的 ED25519 密钥，把公钥加入 ${TARGET_USER} 的
+authorized_keys，并启用密钥登录。
+
+The PRIVATE key will be shown once so you can copy it to your local computer.
+私钥只会显示一次，请复制保存到你的本地电脑。
+
+EOF
+    ask "Key comment / 密钥备注 [${key_comment}]:"
+    read -r input
+    [[ -n "$input" ]] && key_comment="$input"
+
+    warn "The generated private key will have no passphrase unless you add one later locally."
+    warn "生成的私钥默认没有密码保护；复制到本地后建议自行加密保存。"
+    ask "Continue generating a key pair? / 继续生成密钥对吗？[y/N]:"
+    local yn
+    read -r yn
+    [[ "$yn" =~ ^[Yy]$ ]] || { info "Aborted by user / 用户已取消。"; return 0; }
+
+    tmp_dir="$(mktemp -d)"
+    chmod 700 "$tmp_dir"
+    key_path="${tmp_dir}/id_ed25519"
+
+    if ! ssh-keygen -q -t ed25519 -a 100 -N "" -C "$key_comment" -f "$key_path"; then
+        err "Failed to generate key pair / 生成密钥对失败。"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    pubkey="$(cat "${key_path}.pub")"
+    install_public_key "$pubkey" || {
+        rm -rf "$tmp_dir"
+        return 1
+    }
+    enable_pubkey_auth_flow || {
+        warn "Key pair is still in: $tmp_dir"
+        warn "密钥文件暂时保留在：$tmp_dir"
+        return 1
+    }
+
+    cat <<EOF
+
+${BOLD}=== PRIVATE KEY / 私钥 ===${NC}
+Copy everything between the BEGIN and END lines to a local file, for example:
+请复制 BEGIN 到 END 之间的全部内容到本地文件，例如：
+
+  ~/.ssh/${host}_ed25519
+
+Then set local permissions / 然后在本地设置权限：
+
+  chmod 600 ~/.ssh/${host}_ed25519
+
+$(cat "$key_path")
+
+${BOLD}=== PUBLIC KEY / 公钥 ===${NC}
+$pubkey
+
+EOF
+    ask "After saving the private key locally, type SAVED to delete the server copy / 本地保存私钥后，输入 SAVED 删除服务器临时副本:"
+    local confirm
+    read -r confirm
+    if [[ "$confirm" == "SAVED" ]]; then
+        rm -rf "$tmp_dir"
+        ok "Temporary private key deleted from server / 服务器上的临时私钥已删除。"
+    else
+        warn "Temporary key files were kept at: $tmp_dir"
+        warn "临时密钥文件仍保留在：$tmp_dir"
+        warn "Delete them after copying the private key / 复制私钥后请手动删除。"
+    fi
 }
 
 change_password_flow() {
@@ -1053,9 +1143,10 @@ password_key_menu() {
 
 ${BOLD}=== Password & key management / 密码与密钥管理 ===${NC}
   1) Change SSH login password / 修改 SSH 登录密码
-  2) Add public key and enable key login / 添加公钥并启用密钥登录
-  3) Remove public key and restore password login / 删除公钥并恢复密码登录
-  4) Disable password login (key required) / 关闭密码登录（必须先设置好密钥）
+  2) Generate key pair and enable key login / 生成密钥并启用密钥登录
+  3) Add public key and enable key login / 添加公钥并启用密钥登录
+  4) Remove public key and restore password login / 删除公钥并恢复密码登录
+  5) Disable password login (key required) / 关闭密码登录（必须先设置好密钥）
   b) Back / 返回
 EOF
         ask "Choose / 请选择:"
@@ -1063,9 +1154,10 @@ EOF
         read -r c
         case "$c" in
             1) change_password_flow ;;
-            2) add_key_and_enable_flow ;;
-            3) remove_public_key_flow ;;
-            4) disable_password_auth_flow ;;
+            2) generate_key_and_enable_flow ;;
+            3) add_key_and_enable_flow ;;
+            4) remove_public_key_flow ;;
+            5) disable_password_auth_flow ;;
             b|B) return 0 ;;
             *) err "Invalid choice / 无效选项。" ;;
         esac

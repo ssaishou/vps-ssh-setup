@@ -64,9 +64,10 @@ sudo ./ssh-setup.sh
 
 You'll see a bilingual menu — pick the operations you need. The
 recommended sequence on a fresh VPS is: enter **2) Password & key
-management**, choose **2) Add public key and enable key login**, then
-return and choose **1) Change SSH port**. After you have verified key
-login works, use **2 → 4** to disable password login.
+management**, choose **2) Generate key pair and enable key login** or
+**3) Add public key and enable key login**, then return and choose
+**1) Change SSH port**. After you have verified key login works, use
+**2 → 5** to disable password login.
 
 ### Safety features
 
@@ -155,8 +156,9 @@ sudo ./ssh-setup.sh
 ```
 
 进入菜单后按需选择操作。新 VPS 推荐的执行顺序是：进入
-**2) 密码与密钥管理**，选择 **2) 添加公钥并启用密钥登录**，然后返回主菜单选择
-**1) 修改 SSH 端口**。确认密钥登录可用后，再使用 **2 → 4** 关闭密码登录。
+**2) 密码与密钥管理**，选择 **2) 生成密钥并启用密钥登录** 或
+**3) 添加公钥并启用密钥登录**，然后返回主菜单选择 **1) 修改 SSH 端口**。
+确认密钥登录可用后，再使用 **2 → 5** 关闭密码登录。
 
 ### 安全机制
 
