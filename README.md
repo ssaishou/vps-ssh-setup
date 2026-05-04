@@ -32,6 +32,14 @@ A menu-driven Bash script with three operations:
 
 ### Usage
 
+**One-liner (no clone needed):**
+
+```bash
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/main/ssh-setup.sh)
+```
+
+**Or download and run manually:**
+
 ```bash
 # Download / clone, then:
 chmod +x ssh-setup.sh
@@ -98,6 +106,14 @@ VPS as a fallback before changing SSH settings.
 - `root` 用户，或具备 `sudo` 权限的用户
 
 ### 使用方法
+
+**一条命令直接运行（无需 clone）：**
+
+```bash
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/main/ssh-setup.sh)
+```
+
+**或下载后手动运行：**
 
 ```bash
 # 下载或 clone 仓库后：
