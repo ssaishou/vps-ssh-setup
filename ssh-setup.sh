@@ -101,8 +101,9 @@ get_current_port() {
     # Prefer the actual listening port (works for both classic and socket setups).
     local port
     port="$(ss -H -tlnp 2>/dev/null \
-            | awk '$NF ~ /sshd|systemd/ {print $4}' \
-            | awk -F: '{print $NF}' | sort -u | head -n1)"
+            | grep -E 'sshd|ssh\.socket|systemd' \
+            | awk '{print $4}' \
+            | awk -F: '{print $NF}' | sort -un | head -n1)"
     if [[ -z "$port" ]]; then
         port="$($SUDO sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}')"
     fi
@@ -187,14 +188,25 @@ set_sshd_option() {
     local key="$1" value="$2"
     local tmp
     tmp="$(mktemp)"
-    # Strip every existing (commented or not) occurrence, then append the new one.
-    $SUDO awk -v k="$key" 'BEGIN{IGNORECASE=1}
+    # Strip every existing (commented or not) occurrence in the global section
+    # (before any Match block), then append the new directive.
+    # Lines inside Match blocks are left untouched to avoid breaking
+    # per-match overrides.
+    $SUDO awk -v k="$key" '
+        BEGIN { in_match=0 }
         {
-            line=$0
-            sub(/^[ \t]+/,"",line)
-            sub(/^#+[ \t]*/,"",line)
-            split(line,a,/[ \t]+/)
-            if (tolower(a[1])==tolower(k)) next
+            if (!in_match) {
+                stripped=$0
+                sub(/^[ \t]+/,"",stripped)
+                if (stripped ~ /^[Mm]atch[[:space:]]/) {
+                    in_match=1
+                } else {
+                    uncommented=stripped
+                    sub(/^#+[ \t]*/,"",uncommented)
+                    split(uncommented,a," ")
+                    if (tolower(a[1])==tolower(k)) next
+                }
+            }
             print
         }' "$SSHD_CONFIG" > "$tmp"
     printf '%s %s\n' "$key" "$value" >> "$tmp"
@@ -232,13 +244,13 @@ remove_socket_dropin() {
 
 # ---------- restart logic ----------
 restart_ssh() {
-    if [[ -n "$SSH_SOCKET" ]]; then
-        $SUDO systemctl restart "$SSH_SOCKET"
-    fi
-    # Validate config before restarting the service.
+    # Validate config before touching any running service or socket.
     if ! $SUDO sshd -t; then
         err "sshd -t reported a configuration error. NOT restarting service."
         return 1
+    fi
+    if [[ -n "$SSH_SOCKET" ]]; then
+        $SUDO systemctl restart "$SSH_SOCKET"
     fi
     $SUDO systemctl restart "$SSH_SERVICE"
 }
@@ -434,8 +446,14 @@ EOF
         rm -f "$tmp"
     fi
 
-    # Ensure ~/.ssh exists with correct perms (run as the target user).
-    $SUDO -u "$TARGET_USER" mkdir -p "$ssh_dir"
+    # Ensure ~/.ssh exists with correct perms.
+    # When running as root (SUDO=""), $SUDO -u ... would expand to "-u ...",
+    # so fall back to a plain mkdir and let the chown below fix ownership.
+    if [[ -n "$SUDO" ]]; then
+        $SUDO -u "$TARGET_USER" mkdir -p "$ssh_dir"
+    else
+        mkdir -p "$ssh_dir"
+    fi
     $SUDO chmod 700 "$ssh_dir"
     $SUDO chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$ssh_dir"
 
