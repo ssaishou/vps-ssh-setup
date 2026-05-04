@@ -52,6 +52,7 @@ SSHD_USE_DROPIN=0     # 1 if the main config Includes sshd_config.d/*.conf
 TARGET_USER=""        # whose authorized_keys we'll write to
 TARGET_HOME=""
 INSTALL_PATH="/usr/local/bin/ssh-setup"
+INSTALL_SOURCE_URL="https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/dev/ssh-setup.sh"
 
 # Files modified / created in the current flow, used for rollback.
 MODIFIED_FILES=()
@@ -74,10 +75,10 @@ Usage / 用法:
       Show this help / 显示帮助
 
 Remote one-liner / 远程一键运行:
-  bash <(curl -fsSL https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/dev/ssh-setup.sh)
+  bash <(curl -fsSL ${INSTALL_SOURCE_URL})
 
 Remote install / 远程安装:
-  bash <(curl -fsSL https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/dev/ssh-setup.sh) --install
+  bash <(curl -fsSL ${INSTALL_SOURCE_URL}) --install
 
 After installing, run anytime with / 安装后可随时运行:
   ssh-setup
@@ -88,16 +89,25 @@ install_self() {
     local src="${BASH_SOURCE[0]}"
     local tmp=""
 
-    if [[ ! -r "$src" ]]; then
+    if [[ "$src" == /dev/fd/* || "$src" == /proc/self/fd/* ]]; then
+        tmp="$(mktemp)"
+        if ! command -v curl >/dev/null 2>&1; then
+            err "curl is required to install from a remote one-liner."
+            err "通过远程一键命令安装需要 curl。"
+            rm -f "$tmp"
+            return 1
+        fi
+        if ! curl -fsSL -H 'Cache-Control: no-cache' "${INSTALL_SOURCE_URL}?ts=$(date +%s)" -o "$tmp"; then
+            err "Failed to download installer from ${INSTALL_SOURCE_URL}"
+            err "无法从 ${INSTALL_SOURCE_URL} 下载安装文件。"
+            rm -f "$tmp"
+            return 1
+        fi
+        src="$tmp"
+    elif [[ ! -r "$src" ]]; then
         err "Cannot read current script source: $src"
         err "无法读取当前脚本源文件：$src"
         return 1
-    fi
-
-    if [[ "$src" == /dev/fd/* || "$src" == /proc/self/fd/* ]]; then
-        tmp="$(mktemp)"
-        cp "$src" "$tmp"
-        src="$tmp"
     fi
 
     if command -v ssh-setup >/dev/null 2>&1; then
