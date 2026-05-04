@@ -107,7 +107,7 @@ VPS as a fallback before changing SSH settings.
 
 ### 功能简介
 
-一个菜单式的 Bash 脚本，提供两个主要区域：
+一个菜单式的 Bash 脚本，提供两个主要功能：
 
 1. **修改 SSH 端口** — 同时兼容传统 `sshd.service` 模式和 Ubuntu 22.04+
    的 systemd socket 激活模式。会自动更新 `ufw` / `firewalld`（如已启用），
