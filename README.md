@@ -37,6 +37,23 @@ A menu-driven Bash script with two main areas:
 bash <(curl -fsSL https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/main/ssh-setup.sh)
 ```
 
+**Install a reusable command:**
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/main/ssh-setup.sh) --install
+ssh-setup
+```
+
+This installs the script to `/usr/local/bin/ssh-setup`, so you can open
+the interactive menu later by typing `ssh-setup` from any directory.
+
+Other command-line options:
+
+```bash
+ssh-setup --help
+ssh-setup --uninstall
+```
+
 **Or download and run manually:**
 
 ```bash
@@ -110,6 +127,23 @@ VPS as a fallback before changing SSH settings.
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/main/ssh-setup.sh)
+```
+
+**安装成可重复使用的命令：**
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/main/ssh-setup.sh) --install
+ssh-setup
+```
+
+这会把脚本安装到 `/usr/local/bin/ssh-setup`，之后在任意目录输入
+`ssh-setup` 就可以重新打开交互菜单。
+
+其他命令行选项：
+
+```bash
+ssh-setup --help
+ssh-setup --uninstall
 ```
 
 **或下载后手动运行：**
