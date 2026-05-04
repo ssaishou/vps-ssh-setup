@@ -855,10 +855,31 @@ enable_pubkey_auth_flow() {
     ok "Public-key authentication enabled and verified / 密钥登录已启用并验证。"
 }
 
+ask_disable_password_after_key_setup() {
+    cat <<EOF
+
+Public-key login is enabled.
+密钥登录已启用。
+
+Before disabling password login, open a NEW terminal and verify that key login works.
+关闭密码登录前，请打开一个新的终端，确认密钥登录可以成功。
+
+EOF
+    ask "Disable password login now? / 现在关闭密码登录吗？[y/N]:"
+    local yn
+    read -r yn
+    if [[ "$yn" =~ ^[Yy]$ ]]; then
+        disable_password_auth_flow
+    else
+        info "Password login unchanged / 密码登录保持不变。"
+    fi
+}
+
 add_key_and_enable_flow() {
     reset_modified_files
     add_key_flow || return 1
-    enable_pubkey_auth_flow --preserve-tracking
+    enable_pubkey_auth_flow --preserve-tracking || return 1
+    ask_disable_password_after_key_setup
 }
 
 generate_key_and_enable_flow() {
@@ -946,6 +967,8 @@ EOF
         warn "临时密钥文件仍保留在：$tmp_dir"
         warn "Delete them after copying the private key / 复制私钥后请手动删除。"
     fi
+
+    ask_disable_password_after_key_setup
 }
 
 change_password_flow() {
