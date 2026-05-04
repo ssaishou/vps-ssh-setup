@@ -128,7 +128,12 @@ install_self() {
         fi
     fi
 
-    $SUDO install -m 0755 -o root -g root "$src" "$INSTALL_PATH"
+    if ! $SUDO install -m 0755 -o root -g root "$src" "$INSTALL_PATH"; then
+        err "Failed to install to ${INSTALL_PATH}"
+        err "无法安装到 ${INSTALL_PATH}。"
+        rm -f "$tmp"
+        return 1
+    fi
     rm -f "$tmp"
     ok "Installed to ${INSTALL_PATH} / 已安装到 ${INSTALL_PATH}"
     printf '\nRun anytime with / 以后可随时运行：\n  ssh-setup\n'
@@ -259,7 +264,7 @@ detect_target_user() {
 
 get_current_port() {
     # Prefer the active socket unit when socket activation is in use.
-    local port
+    local port=""
     if [[ -n "$SSH_SOCKET" ]]; then
         port="$($SUDO systemctl show "$SSH_SOCKET" --property=Listen --value 2>/dev/null \
                 | sed 's/ (Stream)//g' \
@@ -268,7 +273,7 @@ get_current_port() {
                 | sort -un | head -n1)"
     fi
     if [[ -z "$port" ]]; then
-        port="$(ss -H -tlnp 2>/dev/null \
+        port="$($SUDO ss -H -tlnp 2>/dev/null \
                 | grep -E 'sshd' \
                 | awk '{print $4}' \
                 | awk -F: '{print $NF}' | sort -un | head -n1)"
@@ -556,7 +561,11 @@ restart_ssh() {
         return 1
     fi
     if [[ -n "$SSH_SOCKET" ]]; then
-        $SUDO systemctl restart "$SSH_SOCKET"
+        if ! $SUDO systemctl restart "$SSH_SOCKET"; then
+            err "Failed to restart $SSH_SOCKET"
+            err "重启 $SSH_SOCKET 失败。"
+            return 1
+        fi
     fi
     if [[ -z "$SSH_SERVICE" ]]; then
         return 0
@@ -596,7 +605,7 @@ restore_password_auth() {
 # Feature 1: change SSH port
 # =====================================================================
 change_port_flow() {
-    local current_port new_port
+    local current_port new_port yn choice
     current_port="$(get_current_port)"
     info "Current SSH port appears to be / 当前 SSH 端口似乎是: ${BOLD}${current_port}${NC}"
 
@@ -768,8 +777,17 @@ install_public_key() {
         return 0
     fi
 
-    backup_file "$auth_file" >/dev/null
-    echo "$pubkey" | $SUDO tee -a "$auth_file" >/dev/null
+    local auth_existed=0
+    if $SUDO test -e "$auth_file"; then
+        auth_existed=1
+        backup_file "$auth_file" >/dev/null
+        remember_modified "$auth_file"
+    fi
+
+    printf '%s\n' "$pubkey" | $SUDO tee -a "$auth_file" >/dev/null
+    if (( auth_existed == 0 )); then
+        remember_created "$auth_file"
+    fi
     $SUDO chmod 600 "$auth_file"
     $SUDO chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$auth_file"
     ok "Public key appended to $auth_file / 公钥已添加到 $auth_file"
@@ -801,7 +819,7 @@ EOF
     if command -v ssh-keygen >/dev/null 2>&1; then
         local tmp
         tmp="$(mktemp)"
-        echo "$pubkey" > "$tmp"
+        printf '%s\n' "$pubkey" > "$tmp"
         if ! ssh-keygen -l -f "$tmp" >/dev/null 2>&1; then
             err "ssh-keygen rejected the key as malformed / ssh-keygen 认为该公钥格式错误。"
             rm -f "$tmp"
@@ -812,8 +830,11 @@ EOF
 
     install_public_key "$pubkey"
 }
+
 enable_pubkey_auth_flow() {
-    reset_modified_files
+    if [[ "${1:-}" != "--preserve-tracking" ]]; then
+        reset_modified_files
+    fi
     set_sshd_option "PubkeyAuthentication" "yes"
 
     if ! restart_ssh; then
@@ -835,8 +856,9 @@ enable_pubkey_auth_flow() {
 }
 
 add_key_and_enable_flow() {
+    reset_modified_files
     add_key_flow || return 1
-    enable_pubkey_auth_flow
+    enable_pubkey_auth_flow --preserve-tracking
 }
 
 generate_key_and_enable_flow() {
@@ -884,11 +906,12 @@ EOF
     fi
 
     pubkey="$(cat "${key_path}.pub")"
+    reset_modified_files
     install_public_key "$pubkey" || {
         rm -rf "$tmp_dir"
         return 1
     }
-    enable_pubkey_auth_flow || {
+    enable_pubkey_auth_flow --preserve-tracking || {
         warn "Key pair is still in: $tmp_dir"
         warn "密钥文件暂时保留在：$tmp_dir"
         return 1
@@ -1068,7 +1091,7 @@ disable_password_auth_flow() {
         return 1
     fi
     local key_count
-    key_count="$($SUDO grep -cE '^(ssh-|ecdsa-|sk-)' "$auth_file" 2>/dev/null || echo 0)"
+    key_count="$($SUDO grep -cE '^[[:space:]]*(ssh-|ecdsa-|sk-)' "$auth_file" 2>/dev/null || echo 0)"
     if (( key_count < 1 )); then
         err "$auth_file has no recognizable public keys. Aborting / 没有可识别的公钥，已取消。"
         return 1
