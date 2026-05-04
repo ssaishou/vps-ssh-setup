@@ -43,8 +43,15 @@ fi
 SSH_SERVICE=""        # e.g. ssh.service or sshd.service
 SSH_SOCKET=""         # e.g. ssh.socket if socket activation is in use, else empty
 SSHD_CONFIG="/etc/ssh/sshd_config"
+SSHD_DROPIN_DIR_CFG="/etc/ssh/sshd_config.d"
+SSHD_TARGET=""        # file we write directives to (main config or 00-ssh-setup.conf)
+SSHD_USE_DROPIN=0     # 1 if the main config Includes sshd_config.d/*.conf
 TARGET_USER=""        # whose authorized_keys we'll write to
 TARGET_HOME=""
+
+# Files modified / created in the current flow, used for rollback.
+MODIFIED_FILES=()
+CREATED_FILES=()
 
 # ---------- detection ----------
 detect_ssh_units() {
@@ -150,6 +157,71 @@ backup_file() {
     echo "$dest"
 }
 
+# ---------- change tracking (per-flow rollback) ----------
+reset_modified_files() {
+    MODIFIED_FILES=()
+    CREATED_FILES=()
+}
+
+is_created() {
+    local f="$1" existing
+    for existing in "${CREATED_FILES[@]+"${CREATED_FILES[@]}"}"; do
+        [[ "$existing" == "$f" ]] && return 0
+    done
+    return 1
+}
+
+remember_modified() {
+    local f="$1" existing
+    is_created "$f" && return 0
+    for existing in "${MODIFIED_FILES[@]+"${MODIFIED_FILES[@]}"}"; do
+        [[ "$existing" == "$f" ]] && return 0
+    done
+    MODIFIED_FILES+=("$f")
+}
+
+remember_created() {
+    CREATED_FILES+=("$1")
+}
+
+# Restore every file we touched in the current flow to its pre-flow state.
+restore_modified_files() {
+    local f backup_path
+    for f in "${MODIFIED_FILES[@]+"${MODIFIED_FILES[@]}"}"; do
+        backup_path="$BACKUP_DIR/$(echo "$f" | sed 's|/|_|g')"
+        if $SUDO test -f "$backup_path"; then
+            $SUDO cp -a "$backup_path" "$f"
+            ok "Restored $f"
+        fi
+    done
+    for f in "${CREATED_FILES[@]+"${CREATED_FILES[@]}"}"; do
+        $SUDO rm -f "$f"
+        ok "Removed $f"
+    done
+}
+
+# ---------- sshd_config target detection ----------
+detect_sshd_target() {
+    SSHD_TARGET="$SSHD_CONFIG"
+    SSHD_USE_DROPIN=0
+    if $SUDO grep -qE '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d' "$SSHD_CONFIG" 2>/dev/null; then
+        if $SUDO test -d "$SSHD_DROPIN_DIR_CFG"; then
+            SSHD_TARGET="$SSHD_DROPIN_DIR_CFG/00-ssh-setup.conf"
+            SSHD_USE_DROPIN=1
+            info "sshd_config Includes ${SSHD_DROPIN_DIR_CFG}/*.conf"
+            info "Will write directives to: $SSHD_TARGET"
+        fi
+    fi
+}
+
+# Echo every effective sshd config file (main + included drop-ins), one per line.
+list_sshd_config_files() {
+    echo "$SSHD_CONFIG"
+    if (( SSHD_USE_DROPIN )); then
+        $SUDO find "$SSHD_DROPIN_DIR_CFG" -maxdepth 1 -type f -name '*.conf' 2>/dev/null
+    fi
+}
+
 # ---------- firewall ----------
 detect_firewall() {
     if command -v ufw >/dev/null 2>&1 && $SUDO ufw status 2>/dev/null | grep -q "Status: active"; then
@@ -183,35 +255,107 @@ firewall_close_port() {
 }
 
 # ---------- sshd_config edit ----------
-# Set "Key Value" in sshd_config; replaces existing line(s) or appends.
+# Set "Key Value" so it actually wins. sshd_config uses first-match-wins
+# semantics, which means a value in /etc/ssh/sshd_config.d/50-cloud-init.conf
+# (loaded earlier via Include) overrides anything we append at the bottom of
+# the main config. To get the value we want:
+#   1) Strip uncommented occurrences of $key from every other config file in
+#      the global section (Match blocks left alone).
+#   2) Write the directive to $SSHD_TARGET, which is either the main config
+#      (no Include) or a low-numbered drop-in (00-ssh-setup.conf) that wins
+#      first-match-wins lexically.
 set_sshd_option() {
     local key="$1" value="$2"
-    local tmp
-    tmp="$(mktemp)"
-    # Strip every existing (commented or not) occurrence in the global section
-    # (before any Match block), then append the new directive.
-    # Lines inside Match blocks are left untouched to avoid breaking
-    # per-match overrides.
-    $SUDO awk -v k="$key" '
-        BEGIN { in_match=0 }
-        {
-            if (!in_match) {
-                stripped=$0
-                sub(/^[ \t]+/,"",stripped)
-                if (stripped ~ /^[Mm]atch[[:space:]]/) {
-                    in_match=1
-                } else {
-                    uncommented=stripped
-                    sub(/^#+[ \t]*/,"",uncommented)
-                    split(uncommented,a," ")
-                    if (tolower(a[1])==tolower(k)) next
+    local f tmp
+
+    # Phase 1: strip from every file except SSHD_TARGET.
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        [[ "$f" == "$SSHD_TARGET" ]] && continue
+        $SUDO test -f "$f" || continue
+        if ! $SUDO grep -qiE "^[[:space:]]*${key}[[:space:]]+" "$f"; then
+            continue
+        fi
+        info "Removing conflicting '$key' from $f"
+        backup_file "$f" >/dev/null
+        remember_modified "$f"
+        tmp="$(mktemp)"
+        $SUDO awk -v k="$key" '
+            BEGIN { in_match=0 }
+            {
+                if (!in_match) {
+                    stripped=$0
+                    sub(/^[ \t]+/,"",stripped)
+                    if (stripped ~ /^[Mm]atch[[:space:]]/) {
+                        in_match=1
+                    } else if (stripped !~ /^#/) {
+                        split(stripped,a," ")
+                        if (tolower(a[1])==tolower(k)) next
+                    }
                 }
-            }
-            print
-        }' "$SSHD_CONFIG" > "$tmp"
-    printf '%s %s\n' "$key" "$value" >> "$tmp"
-    $SUDO install -m 0644 -o root -g root "$tmp" "$SSHD_CONFIG"
-    rm -f "$tmp"
+                print
+            }' "$f" > "$tmp"
+        $SUDO install -m 0644 -o root -g root "$tmp" "$f"
+        rm -f "$tmp"
+    done < <(list_sshd_config_files)
+
+    # Phase 2: write the directive to SSHD_TARGET.
+    if $SUDO test -e "$SSHD_TARGET"; then
+        if ! is_created "$SSHD_TARGET"; then
+            backup_file "$SSHD_TARGET" >/dev/null
+            remember_modified "$SSHD_TARGET"
+        fi
+        tmp="$(mktemp)"
+        $SUDO awk -v k="$key" '
+            BEGIN { in_match=0 }
+            {
+                if (!in_match) {
+                    stripped=$0
+                    sub(/^[ \t]+/,"",stripped)
+                    if (stripped ~ /^[Mm]atch[[:space:]]/) {
+                        in_match=1
+                    } else {
+                        uncommented=stripped
+                        sub(/^#+[ \t]*/,"",uncommented)
+                        split(uncommented,a," ")
+                        if (tolower(a[1])==tolower(k)) next
+                    }
+                }
+                print
+            }' "$SSHD_TARGET" > "$tmp"
+        printf '%s %s\n' "$key" "$value" >> "$tmp"
+        $SUDO install -m 0644 -o root -g root "$tmp" "$SSHD_TARGET"
+        rm -f "$tmp"
+    else
+        tmp="$(mktemp)"
+        {
+            echo "# Managed by ssh-setup.sh"
+            echo "# Loaded early via Include; wins first-match-wins over later definitions."
+            printf '%s %s\n' "$key" "$value"
+        } > "$tmp"
+        $SUDO install -m 0644 -o root -g root "$tmp" "$SSHD_TARGET"
+        rm -f "$tmp"
+        remember_created "$SSHD_TARGET"
+    fi
+}
+
+# Verify the effective value of a sshd keyword equals $expected.
+# Returns 0 on match, 1 otherwise. Skips silently if sshd -T can't answer.
+verify_sshd_option() {
+    local key="$1" expected="$2"
+    local lc_key actual
+    lc_key="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
+    actual="$($SUDO sshd -T 2>/dev/null | awk -v k="$lc_key" '$1==k {print $2; exit}')"
+    if [[ -z "$actual" ]]; then
+        warn "Could not query effective $key via sshd -T."
+        return 1
+    fi
+    if [[ "$actual" != "$expected" ]]; then
+        err "Effective $key is '$actual', expected '$expected'."
+        err "Another file is overriding it. Check $SSHD_CONFIG and ${SSHD_DROPIN_DIR_CFG}/*.conf."
+        return 1
+    fi
+    return 0
 }
 
 # ---------- socket drop-in ----------
@@ -285,13 +429,18 @@ change_port_flow() {
         break
     done
 
-    # Backup
-    local backup_sshd_config backup_socket_state="none"
-    backup_sshd_config="$(backup_file "$SSHD_CONFIG")"
+    # Reset per-flow change tracking so a rollback restores only this flow's
+    # modifications, not prior ones in the same session.
+    reset_modified_files
+
+    # Backup the systemd socket drop-in if it already exists, so rollback can
+    # restore it. socket_state lets rollback know whether to delete vs. restore.
+    local backup_socket_state="none"
     if [[ -n "$SSH_SOCKET" ]]; then
         local existing_dropin="/etc/systemd/system/${SSH_SOCKET}.d/override.conf"
         if [[ -f "$existing_dropin" ]]; then
             backup_file "$existing_dropin" >/dev/null
+            remember_modified "$existing_dropin"
             backup_socket_state="existed"
         else
             backup_socket_state="absent"
@@ -299,7 +448,7 @@ change_port_flow() {
     fi
 
     # Apply
-    info "Updating $SSHD_CONFIG (Port $new_port)..."
+    info "Updating SSH config (Port $new_port) via $SSHD_TARGET..."
     set_sshd_option "Port" "$new_port"
 
     if [[ -n "$SSH_SOCKET" ]]; then
@@ -326,7 +475,7 @@ change_port_flow() {
     info "Restarting SSH..."
     if ! restart_ssh; then
         err "SSH restart failed. Rolling back automatically."
-        rollback_port "$current_port" "$backup_sshd_config" "$backup_socket_state" "$fw" "$new_port"
+        rollback_port "$current_port" "$backup_socket_state" "$fw" "$new_port"
         return 1
     fi
 
@@ -361,7 +510,7 @@ EOF
                    [[ "$yn" =~ ^[Yy]$ ]] && firewall_close_port "$fw" "$current_port"
                fi
                return 0 ;;
-            2) rollback_port "$current_port" "$backup_sshd_config" "$backup_socket_state" "$fw" "$new_port"
+            2) rollback_port "$current_port" "$backup_socket_state" "$fw" "$new_port"
                return 0 ;;
             3) warn "Skipping test. Make sure you can reconnect before logging out!"
                return 0 ;;
@@ -371,26 +520,21 @@ EOF
 }
 
 rollback_port() {
-    local old_port="$1" backup_sshd="$2" socket_state="$3" fw="$4" failed_port="$5"
+    local old_port="$1" socket_state="$2" fw="$3" failed_port="$4"
     warn "Rolling back to port ${old_port}..."
 
-    if [[ -n "$backup_sshd" && -f "$backup_sshd" ]]; then
-        $SUDO cp -a "$backup_sshd" "$SSHD_CONFIG"
-        ok "Restored $SSHD_CONFIG"
-    fi
+    # Restore every sshd config file we touched (main + drop-ins + any
+    # 00-ssh-setup.conf we created) and delete files we created from scratch.
+    restore_modified_files
 
+    # The socket drop-in is handled separately because the "absent" case
+    # means we created the file ourselves during this flow.
     if [[ -n "$SSH_SOCKET" ]]; then
         local dropin="/etc/systemd/system/${SSH_SOCKET}.d/override.conf"
-        case "$socket_state" in
-            absent)
-                $SUDO rm -f "$dropin"
-                $SUDO rmdir --ignore-fail-on-non-empty "/etc/systemd/system/${SSH_SOCKET}.d" 2>/dev/null || true
-                ;;
-            existed)
-                local backup_file_path="$BACKUP_DIR/$(echo "$dropin" | sed 's|/|_|g')"
-                [[ -f "$backup_file_path" ]] && $SUDO cp -a "$backup_file_path" "$dropin"
-                ;;
-        esac
+        if [[ "$socket_state" == "absent" ]]; then
+            $SUDO rm -f "$dropin"
+            $SUDO rmdir --ignore-fail-on-non-empty "/etc/systemd/system/${SSH_SOCKET}.d" 2>/dev/null || true
+        fi
         $SUDO systemctl daemon-reload
     fi
 
@@ -515,17 +659,33 @@ EOF
         return 0
     fi
 
-    backup_file "$SSHD_CONFIG" >/dev/null
+    reset_modified_files
     set_sshd_option "PasswordAuthentication" "no"
     set_sshd_option "ChallengeResponseAuthentication" "no"
     set_sshd_option "KbdInteractiveAuthentication" "no"
     set_sshd_option "UsePAM" "yes"  # leave PAM on; the auth method flags above gate it
 
     if ! restart_ssh; then
-        err "SSH restart failed after disabling password auth. Check $BACKUP_DIR for the previous sshd_config."
+        err "SSH restart failed after disabling password auth. Rolling back."
+        restore_modified_files
+        restart_ssh && ok "Rolled back; password auth state unchanged." \
+            || err "Rollback restart also failed. Backups are in: $BACKUP_DIR"
         return 1
     fi
-    ok "Password authentication disabled. SSH restarted."
+
+    # Verify the change actually took effect — sshd_config first-match-wins
+    # means a drop-in we missed could still be saying 'yes'.
+    local mismatch=0
+    verify_sshd_option PasswordAuthentication no || mismatch=1
+    verify_sshd_option KbdInteractiveAuthentication no || mismatch=1
+    if (( mismatch )); then
+        err "Password authentication is NOT effectively disabled. Rolling back."
+        restore_modified_files
+        restart_ssh && warn "Rolled back. Investigate the conflicting file and try again." \
+            || err "Rollback restart failed. Backups are in: $BACKUP_DIR"
+        return 1
+    fi
+    ok "Password authentication disabled and verified. SSH restarted."
 }
 
 # =====================================================================
@@ -561,6 +721,7 @@ main() {
         exit 1
     fi
     detect_ssh_units
+    detect_sshd_target
     detect_target_user
     init_backup_dir
     main_menu
