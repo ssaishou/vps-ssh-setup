@@ -1,12 +1,18 @@
+<div align="right">
+
+[English](#english) | [简体中文](#简体中文)
+
+</div>
+
 # ssh-setup.sh
-
-A script for Debian / Ubuntu servers that changes the SSH port and manages SSH password / key login.
-
-一个用于 Debian / Ubuntu 服务器的修改 SSH 端口以及管理密码 / 密钥登录的脚本。
 
 ---
 
+<a id="english"></a>
+
 ## English
+
+A script for Debian / Ubuntu servers that changes the SSH port and manages SSH password / key login.
 
 ### What it does
 
@@ -103,7 +109,17 @@ VPS as a fallback before changing SSH settings.
 
 ---
 
-## 中文
+<a id="简体中文"></a>
+
+<div align="right">
+
+[Back to top / 回到顶部](#readme)
+
+</div>
+
+## 简体中文
+
+一个用于 Debian / Ubuntu 服务器的修改 SSH 端口以及管理密码 / 密钥登录的脚本。
 
 ### 功能简介
 
