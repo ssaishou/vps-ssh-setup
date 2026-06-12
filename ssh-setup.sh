@@ -42,6 +42,19 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
     fi
 fi
 
+# ---------- stdin ----------
+# When run as `curl ... | bash`, stdin is the script pipe and every read
+# would hit EOF, leaving the menu loops spinning. Reattach to the terminal
+# when possible.
+ensure_tty_stdin() {
+    [[ -t 0 ]] && return 0
+    if (exec </dev/tty) 2>/dev/null; then
+        exec </dev/tty
+        return 0
+    fi
+    return 1
+}
+
 # ---------- globals filled in by detect_* ----------
 SSH_SERVICE=""        # e.g. ssh.service or sshd.service
 SSH_SOCKET=""         # e.g. ssh.socket if socket activation is in use, else empty
@@ -309,6 +322,7 @@ port_in_use() {
 
 # ---------- backup helpers ----------
 BACKUP_DIR=""
+FLOW_SEQ=0
 init_backup_dir() {
     BACKUP_DIR="/var/backups/ssh-setup-$(date +%Y%m%d-%H%M%S)-$$"
     $SUDO mkdir -p "$BACKUP_DIR"
@@ -316,10 +330,19 @@ init_backup_dir() {
     info "Backups will be stored in $BACKUP_DIR"
 }
 
+# Each flow keeps its backups in its own subdirectory so a later flow can
+# never overwrite the pre-flow copies that rollback depends on.
+current_flow_dir() {
+    echo "${BACKUP_DIR}/flow-${FLOW_SEQ}"
+}
+
 backup_file() {
     local src="$1"
-    [[ -e "$src" ]] || return 0
-    local dest="$BACKUP_DIR/$(echo "$src" | sed 's|/|_|g')"
+    $SUDO test -e "$src" || return 0
+    local dir dest
+    dir="$(current_flow_dir)"
+    $SUDO mkdir -p "$dir"
+    dest="$dir/$(echo "$src" | sed 's|/|_|g')"
     $SUDO cp -a "$src" "$dest"
     echo "$dest"
 }
@@ -328,6 +351,7 @@ backup_file() {
 reset_modified_files() {
     MODIFIED_FILES=()
     CREATED_FILES=()
+    FLOW_SEQ=$((FLOW_SEQ + 1))
 }
 
 is_created() {
@@ -338,12 +362,17 @@ is_created() {
     return 1
 }
 
-remember_modified() {
+# Back up $1 and add it to MODIFIED_FILES. The backup is taken only the
+# first time a file is tracked in a flow; repeated calls (e.g. several
+# set_sshd_option invocations touching the same file) must not overwrite
+# the pre-flow copy with an intermediate state.
+track_modified() {
     local f="$1" existing
     is_created "$f" && return 0
     for existing in "${MODIFIED_FILES[@]+"${MODIFIED_FILES[@]}"}"; do
         [[ "$existing" == "$f" ]] && return 0
     done
+    backup_file "$f" >/dev/null
     MODIFIED_FILES+=("$f")
 }
 
@@ -355,7 +384,7 @@ remember_created() {
 restore_modified_files() {
     local f backup_path
     for f in "${MODIFIED_FILES[@]+"${MODIFIED_FILES[@]}"}"; do
-        backup_path="$BACKUP_DIR/$(echo "$f" | sed 's|/|_|g')"
+        backup_path="$(current_flow_dir)/$(echo "$f" | sed 's|/|_|g')"
         if $SUDO test -f "$backup_path"; then
             $SUDO cp -a "$backup_path" "$f"
             ok "Restored $f"
@@ -444,8 +473,7 @@ set_sshd_option() {
             continue
         fi
         info "Removing conflicting '$key' from $f"
-        backup_file "$f" >/dev/null
-        remember_modified "$f"
+        track_modified "$f"
         tmp="$(mktemp)"
         $SUDO awk -v k="$key" '
             BEGIN { in_match=0 }
@@ -468,10 +496,7 @@ set_sshd_option() {
 
     # Phase 2: write the directive to SSHD_TARGET.
     if $SUDO test -e "$SSHD_TARGET"; then
-        if ! is_created "$SSHD_TARGET"; then
-            backup_file "$SSHD_TARGET" >/dev/null
-            remember_modified "$SSHD_TARGET"
-        fi
+        track_modified "$SSHD_TARGET"
         tmp="$(mktemp)"
         $SUDO awk -v k="$key" '
             BEGIN { in_match=0 }
@@ -611,7 +636,7 @@ change_port_flow() {
 
     while true; do
         ask "Enter the new SSH port / 输入新的 SSH 端口 (1-65535):"
-        read -r new_port
+        read -r new_port || { echo; return 1; }
         validate_port "$new_port" || continue
         if [[ "$new_port" == "$current_port" ]]; then
             warn "New port is the same as current port / 新端口和当前端口相同，请换一个。"
@@ -641,8 +666,7 @@ change_port_flow() {
     if [[ -n "$SSH_SOCKET" ]]; then
         local existing_dropin="/etc/systemd/system/${SSH_SOCKET}.d/override.conf"
         if [[ -f "$existing_dropin" ]]; then
-            backup_file "$existing_dropin" >/dev/null
-            remember_modified "$existing_dropin"
+            track_modified "$existing_dropin"
             backup_socket_state="existed"
         else
             backup_socket_state="absent"
@@ -703,7 +727,7 @@ Did the new connection succeed? / 新连接是否成功？
 EOF
     while true; do
         ask "Choose / 请选择 [1/2/3]:"
-        read -r choice
+        read -r choice || { echo; warn "Input closed; keeping new port ${new_port}. Make sure you can reconnect / 输入已结束，保留新端口，请务必确认能重新连接！"; return 0; }
         case "$choice" in
             1) ok "Keeping new port ${new_port} / 保留新端口 ${new_port}。"
                # Close old port in firewall (only if changed)
@@ -780,8 +804,7 @@ install_public_key() {
     local auth_existed=0
     if $SUDO test -e "$auth_file"; then
         auth_existed=1
-        backup_file "$auth_file" >/dev/null
-        remember_modified "$auth_file"
+        track_modified "$auth_file"
     fi
 
     printf '%s\n' "$pubkey" | $SUDO tee -a "$auth_file" >/dev/null
@@ -796,8 +819,8 @@ install_public_key() {
 add_key_flow() {
     cat <<EOF
 
-Paste the public key (single line beginning with ssh-rsa / ssh-ed25519 / ecdsa-sha2-...).
-请粘贴 SSH 公钥（单行，以 ssh-rsa / ssh-ed25519 / ecdsa-sha2-... 开头）。
+Paste the public key (single line beginning with ssh-rsa / ssh-ed25519 / ecdsa-sha2-... / sk-...).
+请粘贴 SSH 公钥（单行，以 ssh-rsa / ssh-ed25519 / ecdsa-sha2-... / sk-... 开头）。
 Press ENTER when done / 粘贴后按回车：
 EOF
     local pubkey
@@ -810,7 +833,7 @@ EOF
         err "Empty input. Aborting / 输入为空，已取消。"
         return 1
     fi
-    if ! [[ "$pubkey" =~ ^(ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-[a-z0-9-]+|sk-(ssh-ed25519|ecdsa-sha2-nistp256))[[:space:]]+[A-Za-z0-9+/=]+([[:space:]]+.*)?$ ]]; then
+    if ! [[ "$pubkey" =~ ^(ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-[a-z0-9-]+|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)[[:space:]]+[A-Za-z0-9+/=]+([[:space:]]+.*)?$ ]]; then
         err "That does not look like a valid OpenSSH public key / 这不像有效的 OpenSSH 公钥。"
         return 1
     fi
@@ -1113,8 +1136,11 @@ disable_password_auth_flow() {
         err "未找到 ${TARGET_USER} 的 authorized_keys。请先添加密钥，拒绝关闭密码登录。"
         return 1
     fi
+    # Note: grep -c prints "0" AND exits non-zero on no match, so an
+    # "|| echo 0" fallback here would yield "0\n0" and break the (( )) test.
     local key_count
-    key_count="$($SUDO grep -cE '^[[:space:]]*(ssh-|ecdsa-|sk-)' "$auth_file" 2>/dev/null || echo 0)"
+    key_count="$($SUDO grep -cE '^[[:space:]]*(ssh-|ecdsa-|sk-)' "$auth_file" 2>/dev/null)"
+    [[ "$key_count" =~ ^[0-9]+$ ]] || key_count=0
     if (( key_count < 1 )); then
         err "$auth_file has no recognizable public keys. Aborting / 没有可识别的公钥，已取消。"
         return 1
@@ -1197,7 +1223,7 @@ ${BOLD}=== Password & key management / 密码与密钥管理 ===${NC}
 EOF
         ask "Choose / 请选择:"
         local c
-        read -r c
+        read -r c || { echo; return 0; }
         case "$c" in
             1) change_password_flow ;;
             2) generate_key_and_enable_flow ;;
@@ -1220,7 +1246,8 @@ ${BOLD}=== SSH setup menu / SSH 设置菜单 ===${NC}
   q) Quit / 退出
 EOF
         ask "Choose / 请选择:"
-        read -r c
+        local c
+        read -r c || { echo; info "Bye / 再见。"; exit 0; }
         case "$c" in
             1) change_port_flow ;;
             2) password_key_menu ;;
@@ -1232,7 +1259,17 @@ EOF
 
 # ---------- entry ----------
 main() {
+    local stdin_ok=1
+    ensure_tty_stdin || stdin_ok=0
+
     handle_cli_args "$@"
+
+    if (( ! stdin_ok )); then
+        err "This script is interactive and needs a terminal on stdin."
+        err "脚本需要交互式终端输入，请改用以下方式运行："
+        err "  bash <(curl -fsSL ${INSTALL_SOURCE_URL})"
+        exit 1
+    fi
 
     info "Interactive SSH setup for Debian/Ubuntu / Debian/Ubuntu 交互式 SSH 设置"
     if [[ ! -f "$SSHD_CONFIG" ]]; then
