@@ -1,0 +1,34 @@
+name: SSH setup regression tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y openssh-server shellcheck
+          sudo mkdir -p /run/sshd
+      - name: Shell syntax and static checks
+        run: |
+          bash -n ssh-setup.sh
+          shellcheck --severity=warning ssh-setup.sh
+      - name: Regression tests and independent rollback timer
+        env:
+          SSH_SETUP_SOCKET_INTEGRATION: ${{ matrix.os == 'ubuntu-24.04' && '1' || '0' }}
+        run: sudo --preserve-env=SSH_SETUP_SOCKET_INTEGRATION python3 -m unittest discover -s tests -v

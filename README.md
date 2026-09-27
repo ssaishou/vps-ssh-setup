@@ -6,198 +6,189 @@
 
 # ssh-setup.sh
 
----
-
 <a id="english"></a>
 
 ## English
 
-A script for Debian / Ubuntu servers that changes the SSH port and manages SSH password / key login.
+An interactive, bilingual SSH configuration script for Debian / Ubuntu.
 
-### What it does
+### Features
 
-A menu-driven Bash script with two main areas:
-
-1. **Change SSH port** — handles both classic `sshd.service` setups and
-   modern systemd socket activation (Ubuntu 22.04+). Updates `ufw` /
-   `firewalld` if present, then keeps your current session alive and
-   asks you to verify the new port from another terminal. If the test
-   fails, you can roll everything back from the same prompt.
-2. **Password & key management** — a submenu for changing the target
-   user's SSH login password, adding a public key and enabling key
-   login, removing a selected public key after restoring password
-   login, and disabling password authentication only after a working
-   key is in place.
+- Change SSH ports on traditional services and systemd socket activation
+  (the Ubuntu default since 22.10), preserving listening addresses and existing
+  socket configuration.
+- Change the current user's password, add or generate a key, remove a selected
+  key after testing password login, and disable password authentication.
+- Update active UFW / firewalld rules when requested.
 
 ### Requirements
 
-- Debian or Ubuntu with systemd
-- OpenSSH server installed
-- `root` or a user with `sudo`
+- Debian / Ubuntu with systemd, OpenSSH server, and `ssh-keygen`.
+- Root or sudo privileges.
+- `ss` (iproute2), `flock` (util-linux), and `systemd-run` for guarded port changes.
+
+The script does not install dependencies or modify cloud security groups.
 
 ### Usage
 
-**One-liner (no clone needed):**
+Run directly:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/main/ssh-setup.sh)
 ```
 
-**Install a reusable command:**
+Install a reusable command:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/main/ssh-setup.sh) --install
 ssh-setup
 ```
 
-This installs the script to `/usr/local/bin/ssh-setup`, so you can open
-the interactive menu later by typing `ssh-setup` from any directory.
+Or run a downloaded copy with `sudo bash ssh-setup.sh`.
+Use `ssh-setup --help` or `ssh-setup --uninstall` to manage the command installed
+at `/usr/local/bin/ssh-setup`.
 
-Other command-line options:
+For a fresh VPS, add your public key first, test it from a separate terminal,
+then change the port. Disable password login only after confirming key login.
+If generating a key on the server, save its displayed private key locally and
+follow the prompt to delete the temporary server copy.
+
+### Recovery and validation
+
+- Every changed file is backed up under
+  `/var/backups/ssh-setup-<random>/flow-<number>/files/`.
+  Failed backups or writes abort the operation. Config and key files are staged
+  and atomically renamed, avoiding truncation on a failed write.
+- A separate root-owned systemd timer restores port changes after **180 seconds**
+  unless you confirm a successful new connection. EOF, interruption, and failed
+  changes also trigger rollback. Confirmation and rollback share a lock, so
+  confirmation cannot race with an already completed rollback.
+- The timer survives SSH disconnection or a killed interactive process, but is
+  **not persistent across a server reboot**. Do not reboot before confirmation.
+- Port changes use a dedicated
+  `/etc/systemd/system/ssh.socket.d/zzzz-ssh-setup-port.conf` drop-in; existing
+  `override.conf` files, listening addresses, and interface restrictions remain.
+- Firewall rollback removes only rules added by this operation. IPv4/IPv6 and
+  firewalld runtime/permanent rules are tracked separately.
+- Global settings are placed before all `Include` and `Match` blocks. Conflicting
+  conditional authentication exceptions, including nested Includes, stop the
+  operation; resolve them explicitly before proceeding.
+- `sshd -t` validates before every restart. Authentication is checked with both
+  global `sshd -T` and connection-specific `sshd -T -C` values. From a local
+  console, the latter uses a loopback connection context.
+- Disabling password login validates actual public-key data and confirms that
+  sshd uses the expected authorized-key file. It cannot test possession of your
+  private key; verify that separately.
+- Key removal provides a password-only test command with connection sharing
+  disabled. Restricted root password login is detected; the script does not
+  automatically relax `PermitRootLogin`.
+- Symlinked config/key files are not replaced; resolve their intended target
+  and ownership manually before using the corresponding edit.
+
+If recovery reports an error, use console access and the printed backup path.
+A port transaction also leaves its root-owned recovery helper there; run
+`sudo bash <flow-directory>/port-transaction.sh rollback` to retry recovery.
+Open any required cloud security-group rule before changing ports.
+
+### Tests
 
 ```bash
-ssh-setup --help
-ssh-setup --uninstall
+bash -n ssh-setup.sh
+shellcheck --severity=warning ssh-setup.sh
+python3 -m unittest discover -s tests -v
 ```
 
-**Or download and run manually:**
-
-```bash
-# Download / clone, then:
-chmod +x ssh-setup.sh
-sudo ./ssh-setup.sh
-```
-
-You'll see a bilingual menu — pick the operations you need. The
-recommended sequence on a fresh VPS is: enter **2) Password & key
-management**, choose **2) Generate key pair and enable key login** or
-**3) Add public key and enable key login**, then return and choose
-**1) Change SSH port**. After you have verified key login works, use
-**2 → 5** to disable password login.
-
-### Safety features
-
-- Every modified file is backed up under
-  `/var/backups/ssh-setup-<timestamp>-<pid>/` before changes.
-- `sshd -t` is run before every restart; if the config is invalid the
-  service is **not** restarted.
-- Service / socket names (`ssh` vs `sshd`) are auto-detected.
-- Socket activation is handled with a systemd drop-in
-  (`/etc/systemd/system/ssh.socket.d/override.conf`) instead of
-  editing distro-shipped unit files.
-- Port-change flow keeps the existing SSH session open and offers an
-  in-script rollback.
-- Disabling password auth is gated on real key presence and effective
-  `sshd -T` verification.
-- Removing a public key restores password login first and asks you to
-  test password login from another terminal before deleting the key.
-
-### What the script does NOT do
-
-- It does **not** test that your private key actually logs you in —
-  that requires a second terminal, which is why the port-change flow
-  pauses for you to verify.
-- It cannot touch cloud-provider security groups (AWS / GCP / Aliyun
-  console firewalls). If your VPS uses one, open the new port there
-  before testing.
-- It does not install OpenSSH, fail2ban, or any other package.
+Tests use temporary configurations and mock firewall commands. Linux root
+enables recovery-helper and real systemd timer tests. CI also tests a separate
+loopback-only SSH socket on Ubuntu 24.04; it does not modify the runner's normal
+SSH service.
 
 ### License
 
-MIT — use at your own risk. Always have console / VNC access to your
-VPS as a fallback before changing SSH settings.
+MIT — use at your own risk. Keep console / VNC access available before changing
+remote SSH configuration.
 
 ---
 
 <a id="简体中文"></a>
 
-<div align="right">
-
-[Back to top / 回到顶部](#readme)
-
-</div>
-
 ## 简体中文
 
-一个用于 Debian / Ubuntu 服务器的修改 SSH 端口以及管理密码 / 密钥登录的脚本。
+用于 Debian / Ubuntu 的中英双语交互式 SSH 配置脚本。
 
-### 功能简介
+### 功能与环境要求
 
-一个菜单式的 Bash 脚本，提供两个主要功能：
+- 修改 SSH 端口，兼容传统服务和 Ubuntu 22.10 起默认使用的 systemd socket 激活模式，
+  保留原有监听地址及 socket 配置。
+- 修改当前用户密码、添加或生成密钥、测试密码登录后删除选定公钥，以及关闭密码认证。
+- 按需更新已启用的 UFW / firewalld。
 
-1. **修改 SSH 端口** — 同时兼容传统 `sshd.service` 模式和 Ubuntu 22.04+
-   的 systemd socket 激活模式。会自动更新 `ufw` / `firewalld`（如已启用），
-   然后**保留当前 SSH 会话**让你从另一个终端测试新端口。如果测试失败，
-   可以在同一交互界面里一键回退。
-2. **密码与密钥管理** — 子菜单内可以修改目标用户的 SSH 登录密码、添加公钥并启用密钥登录、
-   先恢复密码登录再删除指定公钥，以及在确认密钥可用后关闭密码登录。
-
-### 环境要求
-
-- Debian 或 Ubuntu，使用 systemd
-- 已安装 OpenSSH server
-- `root` 用户，或具备 `sudo` 权限的用户
+需要 systemd、OpenSSH server、`ssh-keygen` 和 root / sudo 权限。
+改端口还需要 `ss`（iproute2）、`flock`（util-linux）和 `systemd-run`。
+脚本不会安装依赖，也无法修改云安全组。
 
 ### 使用方法
 
-**一条命令直接运行（无需 clone）：**
+直接运行：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/main/ssh-setup.sh)
 ```
 
-**安装成可重复使用的命令：**
+安装为可重复使用的命令：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/main/ssh-setup.sh) --install
 ssh-setup
 ```
 
-这会把脚本安装到 `/usr/local/bin/ssh-setup`，之后在任意目录输入
-`ssh-setup` 就可以重新打开交互菜单。
+也可以下载后运行 `sudo bash ssh-setup.sh`。
+使用 `ssh-setup --help` 查看帮助，`ssh-setup --uninstall` 删除安装在
+`/usr/local/bin/ssh-setup` 的命令。
 
-其他命令行选项：
+新 VPS 建议先添加公钥，在另一个终端确认密钥登录成功，再修改端口。
+最后再关闭密码登录。如果选择在服务器生成密钥，请先在本地保存显示的私钥，
+再按提示删除服务器的临时副本。
+
+### 恢复与验证机制
+
+- 修改前备份至 `/var/backups/ssh-setup-<随机标识>/flow-<流程编号>/files/`。
+  备份或写入失败会中止操作；配置和公钥先写入临时文件，成功后原子替换。
+- 改端口前启动独立的 root systemd 定时器，**180 秒内未确认新连接成功就自动回滚**。
+  输入结束、中断和操作失败也会回滚；确认和回滚共用锁，避免两者同时发生导致状态错乱。
+- SSH 断线或交互进程被杀不会取消定时器，但定时器**无法跨服务器重启保留**；
+  确认新连接前不要重启服务器。
+- socket 配置使用独立的
+  `/etc/systemd/system/ssh.socket.d/zzzz-ssh-setup-port.conf`，
+  保留管理员已有的 `override.conf`、监听地址和网卡限制。
+- 防火墙回滚只撤销本次新增规则，分别跟踪 IPv4/IPv6 和 firewalld 的运行时/永久规则。
+- 全局选项写在所有 `Include`、`Match` 之前。条件认证配置存在冲突时会停止，
+  包括嵌套 Include 中的例外，需要明确处理后再继续。
+- 每次重启前运行 `sshd -t`，并用 `sshd -T` 和带连接条件的 `sshd -T -C`
+  检查认证配置；从本地控制台运行时使用回环地址作为连接条件。
+- 关闭密码认证前检查公钥内容有效，并确认 sshd 实际使用该公钥文件。
+  脚本无法代替你验证私钥能否登录，仍需另开终端测试。
+- 删除公钥前提供禁用公钥认证和连接复用的密码测试命令。
+  root 密码登录仍受 `PermitRootLogin` 限制时会停止，不会自动放宽该策略。
+- 拒绝覆盖符号链接形式的配置或公钥文件，需先人工明确其链接目标和管理方式。
+
+如果恢复失败，请通过控制台使用输出的备份目录处理。端口修改流程还会保留
+root 管理的恢复脚本，可运行
+`sudo bash <流程目录>/port-transaction.sh rollback` 重试。
+改端口前，请先在云安全组放行新端口。
+
+### 测试
 
 ```bash
-ssh-setup --help
-ssh-setup --uninstall
+bash -n ssh-setup.sh
+shellcheck --severity=warning ssh-setup.sh
+python3 -m unittest discover -s tests -v
 ```
 
-**或下载后手动运行：**
-
-```bash
-# 下载或 clone 仓库后：
-chmod +x ssh-setup.sh
-sudo ./ssh-setup.sh
-```
-
-进入菜单后按需选择操作。新 VPS 推荐的执行顺序是：进入
-**2) 密码与密钥管理**，选择 **2) 生成密钥并启用密钥登录** 或
-**3) 添加公钥并启用密钥登录**，然后返回主菜单选择 **1) 修改 SSH 端口**。
-确认密钥登录可用后，再使用 **2 → 5** 关闭密码登录。
-
-### 安全机制
-
-- 所有被修改的文件都会备份到
-  `/var/backups/ssh-setup-<时间戳>-<进程号>/`
-- 每次重启 sshd 前都会先跑 `sshd -t` 校验配置，不通过就**不重启**
-- 自动识别服务名 / socket 名（`ssh` 或 `sshd`）
-- socket 激活模式下使用 systemd drop-in
-  （`/etc/systemd/system/ssh.socket.d/override.conf`），
-  不会改动发行版自带的 unit 文件
-- 改端口流程会**保留当前会话**，并提供脚本内回退选项
-- 关闭密码登录前强制检查密钥是否真实存在，并通过 `sshd -T` 验证最终有效配置
-- 删除公钥前会先恢复密码登录，并要求你从另一个终端测试密码登录成功后再删除
-
-### 脚本不会做的事
-
-- **不会**真正测试你的私钥能否登录 — 这需要另开一个终端，
-  所以改端口流程会专门停下来等你手动测试
-- 触碰不到云厂商控制台的**安全组**（AWS / GCP / 阿里云 等）。
-  如果你的 VPS 在用安全组，请在控制台先放行新端口再测试
-- 不会安装 OpenSSH、fail2ban 或任何其他软件包
+测试使用临时配置和模拟防火墙命令。Linux root 环境还会测试独立恢复进程和真实
+systemd 定时器。CI 在 Ubuntu 24.04 额外创建仅监听回环地址的独立 SSH socket，
+验证改端口和回滚，不会修改测试机原有的 SSH 服务。
 
 ### 许可证
 
-MIT，使用风险自负。修改 SSH 配置前，**务必确认你有 VPS 控制台 / VNC 的
-紧急访问方式**作为兜底。
+MIT，使用风险自负。修改远程 SSH 配置前，请确保有控制台 / VNC 紧急访问方式。

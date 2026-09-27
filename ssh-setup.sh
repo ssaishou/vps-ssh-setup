@@ -10,9 +10,8 @@
 #      - Remove a public key after restoring password login
 #      - Disable password authentication after verifying a key is in place
 #
-# The port-change step backs up every file it touches and offers a rollback
-# prompt so the user can restore the previous state from the same session
-# if a new-port test connection fails.
+# Port changes are protected by an independent systemd rollback timer.
+# Only a confirmed connection cancels the rollback.
 
 set -uo pipefail
 
@@ -32,15 +31,17 @@ ask()   { printf '%s%s%s '          "$BOLD"   "$*"  "$NC"; }
 
 # ---------- privilege ----------
 SUDO=""
-if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-    if command -v sudo >/dev/null 2>&1; then
-        SUDO="sudo"
-        info "Not running as root, will use sudo for privileged commands."
-    else
-        err "This script needs root privileges (or sudo installed)."
-        exit 1
+init_privileges() {
+    if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+        if command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+            info "Not running as root, will use sudo for privileged commands."
+        else
+            err "This script needs root privileges (or sudo installed)."
+            exit 1
+        fi
     fi
-fi
+}
 
 # ---------- stdin ----------
 # When run as `curl ... | bash`, stdin is the script pipe and every read
@@ -61,8 +62,10 @@ SSH_SOCKET=""         # e.g. ssh.socket if socket activation is in use, else emp
 SSH_SERVICE_MANAGER="systemctl"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_DROPIN_DIR_CFG="/etc/ssh/sshd_config.d"
-SSHD_TARGET=""        # file we write directives to (main config or 00-ssh-setup.conf)
-SSHD_USE_DROPIN=0     # 1 if the main config Includes sshd_config.d/*.conf
+SSHD_TARGET=""        # main config; managed global settings are prepended
+SSHD_INCLUDE_BASE="/etc/ssh"
+SSHD_CONFIG_FILES=()
+SYSTEMD_CONFIG_DIR="/etc/systemd/system"
 TARGET_USER=""        # whose authorized_keys we'll write to
 TARGET_HOME=""
 INSTALL_PATH="/usr/local/bin/ssh-setup"
@@ -71,6 +74,16 @@ INSTALL_SOURCE_URL="https://raw.githubusercontent.com/ssaishou/vps-ssh-setup/mai
 # Files modified / created in the current flow, used for rollback.
 MODIFIED_FILES=()
 CREATED_FILES=()
+FIREWALL_ADDED=()
+TRACKING_FILE=""
+PORT_RUNNER=""
+PORT_TIMER_UNIT=""
+PORT_TIMEOUT=180
+PORT_NEW=""
+PORT_OLD=""
+PORT_FIREWALL=""
+FIREWALL_ZONE=""
+SOCKET_LISTEN_LINES=""
 
 # ---------- install / CLI helpers ----------
 usage() {
@@ -104,7 +117,7 @@ install_self() {
     local tmp=""
 
     if [[ "$src" == /dev/fd/* || "$src" == /proc/self/fd/* ]]; then
-        tmp="$(mktemp)"
+        tmp="$(mktemp)" || return 1
         if ! command -v curl >/dev/null 2>&1; then
             err "curl is required to install from a remote one-liner."
             err "通过远程一键命令安装需要 curl。"
@@ -132,7 +145,7 @@ install_self() {
             warn "系统里已经存在另一个 ssh-setup 命令：$existing"
             ask "Continue installing to ${INSTALL_PATH}? / 仍然安装到 ${INSTALL_PATH} 吗？[y/N]:"
             local yn
-            read -r yn
+            read -r yn || return 1
             if [[ ! "$yn" =~ ^[Yy]$ ]]; then
                 rm -f "$tmp"
                 info "Aborted by user / 用户已取消。"
@@ -160,13 +173,13 @@ uninstall_self() {
 
     ask "Remove ${INSTALL_PATH}? / 删除 ${INSTALL_PATH} 吗？[y/N]:"
     local yn
-    read -r yn
+    read -r yn || return 1
     if [[ ! "$yn" =~ ^[Yy]$ ]]; then
         info "Aborted by user / 用户已取消。"
         return 0
     fi
 
-    $SUDO rm -f "$INSTALL_PATH"
+    $SUDO rm -f "$INSTALL_PATH" || return 1
     ok "Removed ${INSTALL_PATH} / 已删除 ${INSTALL_PATH}"
 }
 
@@ -304,8 +317,8 @@ get_current_port() {
 # ---------- port validation ----------
 validate_port() {
     local port="$1"
-    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
-        err "Port must be a positive integer."
+    if ! [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]]; then
+        err "Port must be a decimal integer without leading zeroes / 端口须为无前导零的十进制整数。"
         return 1
     fi
     if (( port < 1 || port > 65535 )); then
@@ -320,37 +333,61 @@ port_in_use() {
     ss -H -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"
 }
 
-# ---------- backup helpers ----------
+# ---------- checked file writes and rollback journal ----------
 BACKUP_DIR=""
 FLOW_SEQ=0
 init_backup_dir() {
-    BACKUP_DIR="/var/backups/ssh-setup-$(date +%Y%m%d-%H%M%S)-$$"
-    $SUDO mkdir -p "$BACKUP_DIR"
-    $SUDO chmod 700 "$BACKUP_DIR"
-    info "Backups will be stored in $BACKUP_DIR"
+    BACKUP_DIR="$($SUDO mktemp -d /var/backups/ssh-setup-XXXXXXXX)" || return 1
+    $SUDO chmod 700 "$BACKUP_DIR" || return 1
+    info "Backups / 备份目录: $BACKUP_DIR"
 }
 
-# Each flow keeps its backups in its own subdirectory so a later flow can
-# never overwrite the pre-flow copies that rollback depends on.
 current_flow_dir() {
-    echo "${BACKUP_DIR}/flow-${FLOW_SEQ}"
+    printf '%s/flow-%s\n' "$BACKUP_DIR" "$FLOW_SEQ"
+}
+
+# Stage beside the destination so a failed write cannot truncate a live file.
+atomic_install() {
+    local src="$1" dst="$2" mode="$3" owner="$4" group="$5" staged
+    if $SUDO test -L "$dst"; then
+        err "Refusing to replace a symlink / 拒绝覆盖符号链接: $dst"
+        return 1
+    fi
+    staged="$($SUDO mktemp "${dst}.ssh-setup.XXXXXX")" || return 1
+    if ! $SUDO install -m "$mode" -o "$owner" -g "$group" "$src" "$staged" ||
+       ! $SUDO mv -f "$staged" "$dst"; then
+        $SUDO rm -f "$staged"
+        err "Failed to write / 写入失败: $dst"
+        return 1
+    fi
+}
+
+persist_tracking() {
+    [[ -n "$TRACKING_FILE" ]] || return 0
+    local tmp
+    tmp="$(mktemp)" || return 1
+    if ! declare -p MODIFIED_FILES CREATED_FILES FIREWALL_ADDED FIREWALL_ZONE > "$tmp" ||
+       ! atomic_install "$tmp" "$TRACKING_FILE" 0600 root root; then
+        rm -f "$tmp"
+        return 1
+    fi
+    rm -f "$tmp"
 }
 
 backup_file() {
-    local src="$1"
-    $SUDO test -e "$src" || return 0
-    local dir dest
-    dir="$(current_flow_dir)"
-    $SUDO mkdir -p "$dir"
-    dest="$dir/$(echo "$src" | sed 's|/|_|g')"
-    $SUDO cp -a "$src" "$dest"
-    echo "$dest"
+    local src="$1" dest
+    [[ "$src" == /* ]] || return 1
+    $SUDO test -f "$src" || { err "Cannot back up / 无法备份: $src"; return 1; }
+    dest="$(current_flow_dir)/files${src}"
+    $SUDO mkdir -p "${dest%/*}" || return 1
+    $SUDO cp -a "$src" "$dest" || { err "Backup failed / 备份失败: $src"; return 1; }
+    printf '%s\n' "$dest"
 }
 
-# ---------- change tracking (per-flow rollback) ----------
 reset_modified_files() {
     MODIFIED_FILES=()
     CREATED_FILES=()
+    FIREWALL_ADDED=()
     FLOW_SEQ=$((FLOW_SEQ + 1))
 }
 
@@ -362,226 +399,386 @@ is_created() {
     return 1
 }
 
-# Back up $1 and add it to MODIFIED_FILES. The backup is taken only the
-# first time a file is tracked in a flow; repeated calls (e.g. several
-# set_sshd_option invocations touching the same file) must not overwrite
-# the pre-flow copy with an intermediate state.
 track_modified() {
     local f="$1" existing
     is_created "$f" && return 0
     for existing in "${MODIFIED_FILES[@]+"${MODIFIED_FILES[@]}"}"; do
         [[ "$existing" == "$f" ]] && return 0
     done
-    backup_file "$f" >/dev/null
+    backup_file "$f" >/dev/null || return 1
     MODIFIED_FILES+=("$f")
+    persist_tracking
 }
 
 remember_created() {
+    is_created "$1" && return 0
     CREATED_FILES+=("$1")
+    persist_tracking
 }
 
-# Restore every file we touched in the current flow to its pre-flow state.
+prepare_file_change() {
+    if $SUDO test -e "$1"; then
+        track_modified "$1"
+    else
+        # Journal before writing: partial creation also needs to be undone.
+        remember_created "$1"
+    fi
+}
+
 restore_modified_files() {
-    local f backup_path
+    local f backup_path tmp failed=0
     for f in "${MODIFIED_FILES[@]+"${MODIFIED_FILES[@]}"}"; do
-        backup_path="$(current_flow_dir)/$(echo "$f" | sed 's|/|_|g')"
-        if $SUDO test -f "$backup_path"; then
-            $SUDO cp -a "$backup_path" "$f"
-            ok "Restored $f"
+        backup_path="$(current_flow_dir)/files${f}"
+        if ! $SUDO test -f "$backup_path"; then
+            err "Missing backup / 备份缺失: $backup_path"
+            failed=1
+            continue
+        fi
+        tmp="$($SUDO mktemp "${f}.restore.XXXXXX")" || { failed=1; continue; }
+        if $SUDO cp -a "$backup_path" "$tmp" && $SUDO mv -f "$tmp" "$f"; then
+            ok "Restored / 已恢复: $f"
+        else
+            $SUDO rm -f "$tmp"
+            err "Restore failed / 恢复失败: $f"
+            failed=1
         fi
     done
     for f in "${CREATED_FILES[@]+"${CREATED_FILES[@]}"}"; do
-        $SUDO rm -f "$f"
-        ok "Removed $f"
-    done
-}
-
-# ---------- sshd_config target detection ----------
-detect_sshd_target() {
-    SSHD_TARGET="$SSHD_CONFIG"
-    SSHD_USE_DROPIN=0
-    if $SUDO grep -qE '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d' "$SSHD_CONFIG" 2>/dev/null; then
-        if $SUDO test -d "$SSHD_DROPIN_DIR_CFG"; then
-            SSHD_TARGET="$SSHD_DROPIN_DIR_CFG/00-ssh-setup.conf"
-            SSHD_USE_DROPIN=1
-            info "sshd_config Includes ${SSHD_DROPIN_DIR_CFG}/*.conf"
-            info "Will write directives to: $SSHD_TARGET"
+        if $SUDO rm -f "$f"; then
+            ok "Removed / 已删除: $f"
+        else
+            failed=1
         fi
-    fi
+    done
+    return "$failed"
 }
 
-# Echo every effective sshd config file (main + included drop-ins), one per line.
-list_sshd_config_files() {
-    echo "$SSHD_CONFIG"
-    if (( SSHD_USE_DROPIN )); then
-        $SUDO find "$SSHD_DROPIN_DIR_CFG" -maxdepth 1 -type f -name '*.conf' 2>/dev/null
-    fi
+# ---------- sshd configuration discovery ----------
+detect_sshd_target() {
+    # Prefix the main file: first global value wins, before any Include/Match.
+    SSHD_TARGET="$SSHD_CONFIG"
+    info "Managed global settings / 全局配置写入: $SSHD_TARGET"
+}
+
+# Tokenize without eval; reject ambiguous syntax instead of skipping a file.
+config_entries() {
+    # shellcheck disable=SC2016
+    $SUDO awk '
+        function emit(s,    i,c,q,escape,n,token,a) {
+            n=0; token=""; q=""; escape=0
+            for (i=1;i<=length(s);i++) {
+                c=substr(s,i,1)
+                if (escape) { token=token c; escape=0; continue }
+                if (c=="\\") { escape=1; continue }
+                if (q!="") {
+                    if (c==q) q=""; else token=token c
+                    continue
+                }
+                if (c=="\"" || c==sprintf("%c",39)) { q=c; continue }
+                if (c=="#" && token=="") break
+                if (c ~ /[ \t]/ || (c=="=" && n==0)) {
+                    if (token!="") { a[++n]=token; token="" }
+                } else token=token c
+            }
+            if (q!="" || escape) { bad=1; return }
+            if (token!="") a[++n]=token
+            if (!n) return
+            a[1]=tolower(a[1])
+            if (a[1]=="include") {
+                for (i=2;i<=n;i++) {
+                    if (a[i] ~ /[\t\r\n]/) { bad=1; return }
+                    print "include\t" a[i]
+                }
+            } else if (a[1]=="match") print "match\t1"
+            else {
+                if (a[1]=="challengeresponseauthentication")
+                    a[1]="kbdinteractiveauthentication"
+                print "option\t" a[1] "\t" tolower(a[2])
+            }
+        }
+        { emit($0) }
+        END { if (bad) exit 2 }
+    ' "$1"
+}
+
+# Conservatively carry conditional scope across Includes.
+SCAN_IN_MATCH=0
+SCAN_KEY=""
+SCAN_VALUE=""
+scan_config_file() {
+    local file="$1" depth="$2" entries type name value pattern matches child
+    (( depth < 32 )) || { err "Include recursion is too deep / Include 嵌套过深。"; return 1; }
+    $SUDO test -f "$file" || return 1
+    entries="$(config_entries "$file")" || { err "Cannot parse / 无法解析: $file"; return 1; }
+    SSHD_CONFIG_FILES+=("$file")
+    while IFS=$'\t' read -r type name value; do
+        case "$type" in
+            match) SCAN_IN_MATCH=1 ;;
+            option)
+                if (( SCAN_IN_MATCH )) && [[ "$name" == "$SCAN_KEY" && "$value" != "$SCAN_VALUE" ]]; then
+                    err "Conflicting Match option / Match 条件配置冲突: $file ($name $value)"
+                    err "Resolve this exception first / 请先处理该例外，再修改认证方式。"
+                    return 1
+                fi
+                ;;
+            include)
+                pattern="$name"
+                [[ "$pattern" == /* ]] || pattern="$SSHD_INCLUDE_BASE/$pattern"
+                matches="$($SUDO bash -c 'compgen -G "$1" || test "$?" -eq 1' _ "$pattern")" || return 1
+                matches="$(printf '%s\n' "$matches" | LC_ALL=C sort)" || return 1
+                while IFS= read -r child; do
+                    [[ -n "$child" ]] || continue
+                    scan_config_file "$child" "$((depth + 1))" || return 1
+                done <<< "$matches"
+                ;;
+        esac
+    done <<< "$entries"
+}
+
+scan_sshd_config() {
+    SSHD_CONFIG_FILES=()
+    SCAN_IN_MATCH=0
+    SCAN_KEY="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+    [[ "$SCAN_KEY" != challengeresponseauthentication ]] || SCAN_KEY=kbdinteractiveauthentication
+    SCAN_VALUE="${2:-}"
+    scan_config_file "$SSHD_CONFIG" 0
 }
 
 # ---------- firewall ----------
 detect_firewall() {
-    if command -v ufw >/dev/null 2>&1 && $SUDO ufw status 2>/dev/null | grep -q "Status: active"; then
-        echo "ufw"
-    elif command -v firewall-cmd >/dev/null 2>&1 && $SUDO firewall-cmd --state 2>/dev/null | grep -q "running"; then
-        echo "firewalld"
-    else
-        echo ""
+    local output
+    if command -v ufw >/dev/null 2>&1; then
+        output="$(LC_ALL=C $SUDO ufw status)" || return 1
+        if [[ "$output" == *"Status: active"* ]]; then
+            printf 'ufw\n'
+            return 0
+        fi
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        output="$($SUDO firewall-cmd --state 2>/dev/null)" || output=""
+        [[ "$output" != running ]] || { printf 'firewalld\n'; return 0; }
     fi
 }
 
 firewall_open_port() {
-    local fw="$1" port="$2"
+    local fw="$1" port="$2" family address output result ipv6=0 kind status
     case "$fw" in
-        ufw)       $SUDO ufw allow "${port}/tcp" >/dev/null && ok "ufw: allowed ${port}/tcp" ;;
-        firewalld) $SUDO firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null \
-                   && $SUDO firewall-cmd --reload >/dev/null \
-                   && ok "firewalld: added ${port}/tcp" ;;
+        ufw)
+            # Run families separately: an existing IPv4 rule must survive
+            # rollback even if this operation adds a new IPv6 rule.
+            if $SUDO grep -qiE '^[[:space:]]*IPV6[[:space:]]*=[[:space:]]*yes' /etc/default/ufw; then
+                ipv6=1
+            fi
+            for family in 4 6; do
+                [[ "$family" != 6 || "$ipv6" == 1 ]] || continue
+                if [[ "$family" == 4 ]]; then address=0.0.0.0/0; else address=::/0; fi
+                result=0
+                output="$(LC_ALL=C $SUDO ufw allow proto tcp from "$address" to any port "$port" 2>&1)" || result=$?
+                if [[ "$output" == *"Rule added"* || "$output" == *"Rules updated"* ]]; then
+                    FIREWALL_ADDED+=("ufw$family")
+                    persist_tracking || return 1
+                elif [[ "$output" != *"Skipping adding existing rule"* ]]; then
+                    err "Could not confirm firewall update / 无法确认防火墙更新: $output"
+                    return 1
+                fi
+                (( result == 0 )) || { err "$output"; return 1; }
+            done
+            ;;
+        firewalld)
+            FIREWALL_ZONE="$($SUDO firewall-cmd --get-default-zone)" || return 1
+            for kind in runtime permanent; do
+                local flags=("--zone=$FIREWALL_ZONE")
+                [[ "$kind" != permanent ]] || flags+=(--permanent)
+                status=0
+                $SUDO firewall-cmd "${flags[@]}" --query-port="${port}/tcp" >/dev/null || status=$?
+                if (( status == 0 )); then continue; fi
+                (( status == 1 )) || return 1
+                # The queried rule was absent; journal intent before adding.
+                FIREWALL_ADDED+=("firewalld-$kind")
+                persist_tracking || return 1
+                $SUDO firewall-cmd "${flags[@]}" --add-port="${port}/tcp" >/dev/null || return 1
+            done
+            ;;
+        "") return 0 ;;
+        *) return 1 ;;
     esac
+    ok "Firewall ready for ${port}/tcp / 防火墙已准备好新端口。"
+}
+
+rollback_firewall() {
+    local port="$1" kind address failed=0
+    for kind in "${FIREWALL_ADDED[@]+"${FIREWALL_ADDED[@]}"}"; do
+        case "$kind" in
+            ufw4|ufw6)
+                if [[ "$kind" == ufw4 ]]; then address=0.0.0.0/0; else address=::/0; fi
+                $SUDO ufw --force delete allow proto tcp from "$address" to any port "$port" >/dev/null || failed=1
+                ;;
+            firewalld-runtime)
+                $SUDO firewall-cmd "--zone=$FIREWALL_ZONE" --remove-port="${port}/tcp" >/dev/null || failed=1 ;;
+            firewalld-permanent)
+                $SUDO firewall-cmd "--zone=$FIREWALL_ZONE" --permanent --remove-port="${port}/tcp" >/dev/null || failed=1 ;;
+        esac
+    done
+    return "$failed"
 }
 
 firewall_close_port() {
-    local fw="$1" port="$2"
+    local fw="$1" port="$2" zone
     case "$fw" in
-        ufw)       $SUDO ufw delete allow "${port}/tcp" >/dev/null 2>&1 \
-                   && ok "ufw: removed ${port}/tcp rule" ;;
-        firewalld) $SUDO firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 \
-                   && $SUDO firewall-cmd --reload >/dev/null \
-                   && ok "firewalld: removed ${port}/tcp" ;;
+        ufw) $SUDO ufw delete allow "${port}/tcp" ;;
+        firewalld)
+            zone="$($SUDO firewall-cmd --get-default-zone)" || return 1
+            $SUDO firewall-cmd "--zone=$zone" --remove-port="${port}/tcp" &&
+                $SUDO firewall-cmd "--zone=$zone" --permanent --remove-port="${port}/tcp"
+            ;;
     esac
 }
 
 # ---------- sshd_config edit ----------
-# Set "Key Value" so it actually wins. sshd_config uses first-match-wins
-# semantics, which means a value in /etc/ssh/sshd_config.d/50-cloud-init.conf
-# (loaded earlier via Include) overrides anything we append at the bottom of
-# the main config. To get the value we want:
-#   1) Strip uncommented occurrences of $key from every other config file in
-#      the global section (Match blocks left alone).
-#   2) Write the directive to $SSHD_TARGET, which is either the main config
-#      (no Include) or a low-numbered drop-in (00-ssh-setup.conf) that wins
-#      first-match-wins lexically.
 set_sshd_option() {
-    local key="$1" value="$2"
-    local f tmp
-
-    # Phase 1: strip from every file except SSHD_TARGET.
+    local key="$1" value="$2" f tmp files
+    scan_sshd_config "$key" "$value" || return 1
+    files="$(printf '%s\n' "${SSHD_CONFIG_FILES[@]}" | LC_ALL=C sort -u)" || return 1
     while IFS= read -r f; do
-        [[ -z "$f" ]] && continue
-        [[ "$f" == "$SSHD_TARGET" ]] && continue
-        $SUDO test -f "$f" || continue
-        if ! $SUDO grep -qiE "^[[:space:]]*${key}[[:space:]]+" "$f"; then
+        # Port is additive across Includes; other global settings use the
+        # first value, so only the main file needs to change for them.
+        [[ "$key" == Port || "$f" == "$SSHD_TARGET" ]] || continue
+        tmp="$(mktemp)" || return 1
+        # shellcheck disable=SC2016
+        if ! $SUDO awk -v k="$key" -v v="$value" -v target="$SSHD_TARGET" '
+            BEGIN { k=tolower(k); in_match=0; wrote=0 }
+            FNR==1 { if (FILENAME==target) { print k " " v; wrote=1 } }
+            {
+                line=$0; sub(/^[ \t]+/,"",line)
+                split(line,a,/[ \t=]+/)
+                option=tolower(a[1])
+                if (option=="match") in_match=1
+                if (option=="challengeresponseauthentication") option="kbdinteractiveauthentication"
+                normalized=k
+                if (normalized=="challengeresponseauthentication") normalized="kbdinteractiveauthentication"
+                if (!in_match && option==normalized) next
+                print
+            }
+            END { if (!wrote && FILENAME==target) print k " " v }
+        ' "$f" > "$tmp"; then
+            rm -f "$tmp"
+            return 1
+        fi
+        if $SUDO cmp -s "$tmp" "$f"; then
+            rm -f "$tmp"
             continue
         fi
-        info "Removing conflicting '$key' from $f"
-        track_modified "$f"
-        tmp="$(mktemp)"
-        $SUDO awk -v k="$key" '
-            BEGIN { in_match=0 }
-            {
-                if (!in_match) {
-                    stripped=$0
-                    sub(/^[ \t]+/,"",stripped)
-                    if (stripped ~ /^[Mm]atch[[:space:]]/) {
-                        in_match=1
-                    } else if (stripped !~ /^#/) {
-                        split(stripped,a," ")
-                        if (tolower(a[1])==tolower(k)) next
-                    }
-                }
-                print
-            }' "$f" > "$tmp"
-        $SUDO install -m 0644 -o root -g root "$tmp" "$f"
+        if ! prepare_file_change "$f" || ! atomic_install "$tmp" "$f" 0644 root root; then
+            rm -f "$tmp"
+            return 1
+        fi
         rm -f "$tmp"
-    done < <(list_sshd_config_files)
+    done <<< "$files"
+}
 
-    # Phase 2: write the directive to SSHD_TARGET.
-    if $SUDO test -e "$SSHD_TARGET"; then
-        track_modified "$SSHD_TARGET"
-        tmp="$(mktemp)"
-        $SUDO awk -v k="$key" '
-            BEGIN { in_match=0 }
-            {
-                if (!in_match) {
-                    stripped=$0
-                    sub(/^[ \t]+/,"",stripped)
-                    if (stripped ~ /^[Mm]atch[[:space:]]/) {
-                        in_match=1
-                    } else {
-                        uncommented=stripped
-                        sub(/^#+[ \t]*/,"",uncommented)
-                        split(uncommented,a," ")
-                        if (tolower(a[1])==tolower(k)) next
-                    }
-                }
-                print
-            }' "$SSHD_TARGET" > "$tmp"
-        printf '%s %s\n' "$key" "$value" >> "$tmp"
-        $SUDO install -m 0644 -o root -g root "$tmp" "$SSHD_TARGET"
-        rm -f "$tmp"
+connection_spec() {
+    local addr=127.0.0.1 _remote_port=0 laddr=127.0.0.1 lport=22 extra=""
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        read -r addr _remote_port laddr lport extra <<< "$SSH_CONNECTION"
+        [[ -n "$addr" && -n "$laddr" && "$lport" =~ ^[0-9]+$ && -z "$extra" ]] || return 1
+    fi
+    printf 'user=%s,host=%s,addr=%s,laddr=%s,lport=%s\n' "$TARGET_USER" "$addr" "$addr" "$laddr" "$lport"
+}
+
+effective_sshd_config() {
+    if [[ "${1:-}" == connection ]]; then
+        local spec
+        spec="$(connection_spec)" || return 1
+        $SUDO sshd -T -f "$SSHD_CONFIG" -C "$spec"
     else
-        tmp="$(mktemp)"
-        {
-            echo "# Managed by ssh-setup.sh"
-            echo "# Loaded early via Include; wins first-match-wins over later definitions."
-            printf '%s %s\n' "$key" "$value"
-        } > "$tmp"
-        $SUDO install -m 0644 -o root -g root "$tmp" "$SSHD_TARGET"
-        rm -f "$tmp"
-        remember_created "$SSHD_TARGET"
+        $SUDO sshd -T -f "$SSHD_CONFIG"
     fi
 }
 
-# Verify the effective value of a sshd keyword equals $expected.
-# Returns 0 on match, 1 otherwise. Skips silently if sshd -T can't answer.
 verify_sshd_option() {
-    local key="$1" expected="$2"
-    local lc_key actual
+    local key="$1" expected="$2" lc_key config actual scope
     lc_key="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
-    actual="$($SUDO sshd -T 2>/dev/null | awk -v k="$lc_key" '$1==k {print $2; exit}')"
-    if [[ -z "$actual" ]]; then
-        warn "Could not query effective $key via sshd -T."
-        return 1
+    [[ "$lc_key" != challengeresponseauthentication ]] || lc_key=kbdinteractiveauthentication
+    for scope in global connection; do
+        config="$(effective_sshd_config "$scope")" || return 1
+        actual="$(awk -v k="$lc_key" '$1==k {print $2}' <<< "$config")"
+        if [[ "$actual" != "$expected" ]]; then
+            err "Effective $key ($scope) is '$actual', expected '$expected' / 实际配置不符合预期。"
+            return 1
+        fi
+    done
+}
+
+rollback_config_flow() {
+    err "Operation failed; restoring backups / 操作失败，正在恢复备份。"
+    [[ -n "${MODIFIED_FILES[*]:-}${CREATED_FILES[*]:-}" ]] || return 1
+    if restore_modified_files && restart_ssh; then
+        warn "Previous configuration restored / 已恢复原配置。"
+    else
+        err "Recovery failed; backups / 恢复失败，备份位于: $BACKUP_DIR"
     fi
-    if [[ "$actual" != "$expected" ]]; then
-        err "Effective $key is '$actual', expected '$expected'."
-        err "Another file is overriding it. Check $SSHD_CONFIG and ${SSHD_DROPIN_DIR_CFG}/*.conf."
-        return 1
-    fi
-    return 0
+    return 1
+}
+
+apply_auth_options() {
+    local pairs=("$@") key value i
+    # Check every conditional exception before making any changes.
+    for ((i=0; i<${#pairs[@]}; i+=2)); do
+        scan_sshd_config "${pairs[i]}" "${pairs[i+1]}" || { rollback_config_flow; return 1; }
+    done
+    for ((i=0; i<${#pairs[@]}; i+=2)); do
+        key="${pairs[i]}" value="${pairs[i+1]}"
+        set_sshd_option "$key" "$value" || { rollback_config_flow; return 1; }
+    done
+    $SUDO sshd -t -f "$SSHD_CONFIG" || { rollback_config_flow; return 1; }
+    for ((i=0; i<${#pairs[@]}; i+=2)); do
+        verify_sshd_option "${pairs[i]}" "${pairs[i+1]}" || { rollback_config_flow; return 1; }
+    done
+    restart_ssh || { rollback_config_flow; return 1; }
 }
 
 # ---------- socket drop-in ----------
 SOCKET_DROPIN_DIR=""
 SOCKET_DROPIN_FILE=""
-write_socket_dropin() {
-    local port="$1"
-    SOCKET_DROPIN_DIR="/etc/systemd/system/${SSH_SOCKET}.d"
-    SOCKET_DROPIN_FILE="${SOCKET_DROPIN_DIR}/override.conf"
-    $SUDO mkdir -p "$SOCKET_DROPIN_DIR"
-    local tmp
-    tmp="$(mktemp)"
-    cat > "$tmp" <<EOF
-[Socket]
-ListenStream=
-ListenStream=${port}
-EOF
-    $SUDO install -m 0644 -o root -g root "$tmp" "$SOCKET_DROPIN_FILE"
-    rm -f "$tmp"
-    $SUDO systemctl daemon-reload
+socket_listen_lines() {
+    local port="$1" output address type rest
+    output="$($SUDO systemctl show "$SSH_SOCKET" --property=Listen --value)" || return 1
+    [[ -n "$output" ]] || return 1
+    while [[ -n "$output" ]]; do
+        read -r address type rest <<< "$output"
+        [[ "$type" == "(Stream)" ]] || { err "Unsupported SSH socket listener / 不支持的 socket 监听配置。"; return 1; }
+        case "$address" in
+            \[*\]:[0-9]*|[0-9]*.[0-9]*.[0-9]*.[0-9]*:[0-9]*)
+                printf 'ListenStream=%s:%s\n' "${address%:*}" "$port" ;;
+            *)
+                err "Cannot safely preserve socket address / 无法安全保留监听地址: $address"
+                return 1 ;;
+        esac
+        output="$rest"
+    done
 }
 
-remove_socket_dropin() {
-    if [[ -n "$SOCKET_DROPIN_FILE" && -f "$SOCKET_DROPIN_FILE" ]]; then
-        $SUDO rm -f "$SOCKET_DROPIN_FILE"
-        $SUDO rmdir --ignore-fail-on-non-empty "$SOCKET_DROPIN_DIR" 2>/dev/null || true
-        $SUDO systemctl daemon-reload
+write_socket_dropin() {
+    local tmp
+    SOCKET_DROPIN_DIR="$SYSTEMD_CONFIG_DIR/${SSH_SOCKET}.d"
+    # Never overwrite an administrator's override.conf.
+    SOCKET_DROPIN_FILE="$SOCKET_DROPIN_DIR/zzzz-ssh-setup-port.conf"
+    $SUDO mkdir -p "$SOCKET_DROPIN_DIR" || return 1
+    tmp="$(mktemp)" || return 1
+    if ! printf '[Socket]\nListenStream=\n%s\n' "$SOCKET_LISTEN_LINES" > "$tmp" ||
+       ! prepare_file_change "$SOCKET_DROPIN_FILE" ||
+       ! atomic_install "$tmp" "$SOCKET_DROPIN_FILE" 0644 root root; then
+        rm -f "$tmp"
+        return 1
     fi
+    rm -f "$tmp"
+    $SUDO systemctl daemon-reload
 }
 
 # ---------- restart logic ----------
 restart_ssh() {
     # Validate config before touching any running service or socket.
-    if ! $SUDO sshd -t; then
+    if ! $SUDO sshd -t -f "$SSHD_CONFIG"; then
         err "sshd -t reported a configuration error. NOT restarting service."
         return 1
     fi
@@ -604,176 +801,255 @@ restart_ssh() {
 
 restore_password_auth() {
     reset_modified_files
-    set_sshd_option "PasswordAuthentication" "yes"
-    set_sshd_option "KbdInteractiveAuthentication" "yes"
-    set_sshd_option "UsePAM" "yes"
-
-    if ! restart_ssh; then
-        err "SSH restart failed after restoring password login. Rolling back."
-        err "恢复密码登录后重启 SSH 失败，正在回滚。"
-        restore_modified_files
-        restart_ssh >/dev/null 2>&1 || err "Rollback restart failed. Manual intervention required."
-        return 1
-    fi
-
-    if ! verify_sshd_option PasswordAuthentication yes; then
-        err "Password login is NOT effectively enabled. Rolling back."
-        err "密码登录没有真正启用，正在回滚。"
-        restore_modified_files
-        restart_ssh >/dev/null 2>&1 || err "Rollback restart failed. Manual intervention required."
-        return 1
+    apply_auth_options PasswordAuthentication yes KbdInteractiveAuthentication yes UsePAM yes || return 1
+    if [[ "$TARGET_USER" == root ]]; then
+        if ! verify_sshd_option PermitRootLogin yes; then
+            err "Root password login is restricted by PermitRootLogin / root 密码登录仍受 PermitRootLogin 限制。"
+            rollback_config_flow
+            return 1
+        fi
     fi
     ok "Password login restored and verified / 密码登录已恢复并验证。"
 }
 
 # =====================================================================
-# Feature 1: change SSH port
+# Feature 1: guarded SSH port transaction
 # =====================================================================
-change_port_flow() {
-    local current_port new_port yn choice
-    current_port="$(get_current_port)"
-    info "Current SSH port appears to be / 当前 SSH 端口似乎是: ${BOLD}${current_port}${NC}"
+verify_port_listener() {
+    local output listeners
+    if [[ -n "$SSH_SOCKET" ]]; then
+        listeners="$(socket_listen_lines "$PORT_NEW" | LC_ALL=C sort -u)" || return 1
+        [[ "$listeners" == "$SOCKET_LISTEN_LINES" ]] || return 1
+        output="$($SUDO systemctl show "$SSH_SOCKET" --property=Listen --value)" || return 1
+        # The queried active socket must use the new port on every address.
+        local address type rest
+        while [[ -n "$output" ]]; do
+            read -r address type rest <<< "$output"
+            [[ "$type" == "(Stream)" && "${address##*:}" == "$PORT_NEW" ]] || return 1
+            output="$rest"
+        done
+    fi
+    output="$($SUDO ss -H -tlnp)" || return 1
+    awk -v p="$PORT_NEW" '
+        $4 ~ (":" p "$") && ($0 ~ /"sshd"/ || $0 ~ /"systemd"/) {found=1}
+        END {exit !found}
+    ' <<< "$output"
+}
 
+apply_port_changes() {
+    set_sshd_option Port "$PORT_NEW" || return 1
+    if [[ -n "$SSH_SOCKET" ]]; then
+        write_socket_dropin || return 1
+    fi
+    firewall_open_port "$PORT_FIREWALL" "$PORT_NEW" || return 1
+    verify_sshd_option Port "$PORT_NEW" || return 1
+    restart_ssh || return 1
+    verify_port_listener || { err "New SSH listener not verified / 未能验证新的 SSH 监听端口。"; return 1; }
+}
+
+rollback_port() {
+    local failed=0 config_failed=0
+    warn "Restoring SSH port $PORT_OLD / 正在恢复 SSH 端口 $PORT_OLD..."
+    restore_modified_files || config_failed=1
+    if [[ -n "$SSH_SOCKET" ]]; then
+        $SUDO systemctl daemon-reload || config_failed=1
+    fi
+    rollback_firewall "$PORT_NEW" || failed=1
+    # Do not restart using partially restored configuration.
+    if (( config_failed == 0 )); then
+        restart_ssh || failed=1
+    else
+        failed=1
+    fi
+    if (( failed )); then
+        err "Rollback incomplete; backups / 回滚未完成，备份位于: $BACKUP_DIR"
+        return 1
+    fi
+    ok "Previous SSH configuration restored / 已恢复原 SSH 配置。"
+}
+
+write_port_status() {
+    local tmp
+    tmp="$(mktemp)" || return 1
+    if ! printf '%s\n' "$1" > "$tmp" ||
+       ! atomic_install "$tmp" "${PORT_RUNNER}.status" 0600 root root; then
+        rm -f "$tmp"
+        return 1
+    fi
+    rm -f "$tmp"
+}
+
+port_transaction() (
+    # A separate root process holds this lock for mutations only. The timer
+    # can restore while the interactive parent waits, even after SIGKILL/HUP.
+    exec 9>"${PORT_RUNNER}.lock" || exit 1
+    flock -x 9 || exit 1
+    local state
+    state="$(cat "${PORT_RUNNER}.status")" || exit 1
+    if [[ -f "$TRACKING_FILE" ]]; then
+        # Root-owned state generated solely with declare -p.
+        # shellcheck disable=SC1090
+        source "$TRACKING_FILE" || exit 1
+    fi
+    case "$1" in
+        apply)
+            [[ "$state" == pending ]] || exit 1
+            if ! apply_port_changes; then
+                if rollback_port; then write_port_status rolled-back; fi
+                exit 1
+            fi
+            ;;
+        commit)
+            [[ "$state" == pending ]] || {
+                err "Port was already rolled back / 端口已回滚，不能确认保留。"
+                exit 1
+            }
+            verify_port_listener || exit 1
+            write_port_status committed || exit 1
+            ;;
+        rollback)
+            [[ "$state" == pending ]] || exit 0
+            rollback_port && write_port_status rolled-back
+            ;;
+        *) exit 1 ;;
+    esac
+)
+
+arm_port_rollback() {
+    local dir tmp function_name
+    command -v systemd-run >/dev/null 2>&1 && command -v flock >/dev/null 2>&1 || {
+        err "Port changes require systemd-run and flock for automatic recovery / 改端口需要 systemd-run 和 flock 提供自动恢复。"
+        return 1
+    }
+    dir="$(current_flow_dir)"
+    $SUDO mkdir -p "$dir" || return 1
+    PORT_RUNNER="$dir/port-transaction.sh"
+    PORT_TIMER_UNIT="ssh-setup-rollback-$$-$FLOW_SEQ"
+    TRACKING_FILE="$dir/tracking.sh"
+    tmp="$(mktemp)" || return 1
+    {
+        printf '#!/bin/bash\nset -uo pipefail\nPATH=/usr/sbin:/usr/bin:/sbin:/bin\nexport PATH\n'
+        declare -p RED GREEN YELLOW BLUE BOLD NC BACKUP_DIR FLOW_SEQ \
+            SSH_SERVICE SSH_SOCKET SSH_SERVICE_MANAGER SSHD_CONFIG SSHD_TARGET \
+            SSHD_DROPIN_DIR_CFG SSHD_INCLUDE_BASE SSHD_CONFIG_FILES SYSTEMD_CONFIG_DIR \
+            SCAN_IN_MATCH SCAN_KEY SCAN_VALUE SOCKET_LISTEN_LINES \
+            MODIFIED_FILES CREATED_FILES FIREWALL_ADDED FIREWALL_ZONE \
+            PORT_NEW PORT_OLD PORT_FIREWALL PORT_RUNNER TRACKING_FILE
+        printf 'SUDO=""\nSSH_CONNECTION=%q\n' "${SSH_CONNECTION:-}"
+        for function_name in info ok warn err atomic_install persist_tracking \
+            current_flow_dir backup_file is_created track_modified remember_created \
+            prepare_file_change restore_modified_files config_entries scan_config_file \
+            scan_sshd_config set_sshd_option connection_spec effective_sshd_config \
+            verify_sshd_option socket_listen_lines write_socket_dropin restart_ssh \
+            firewall_open_port rollback_firewall verify_port_listener apply_port_changes \
+            rollback_port write_port_status port_transaction; do
+            declare -f "$function_name" || exit 1
+        done
+        printf 'port_transaction "$@"\n'
+    } > "$tmp"
+    local result=$?
+    if (( result != 0 )) || ! atomic_install "$tmp" "$PORT_RUNNER" 0700 root root ||
+       ! write_port_status pending; then
+        rm -f "$tmp"
+        PORT_RUNNER=""
+        TRACKING_FILE=""
+        return 1
+    fi
+    rm -f "$tmp"
+    if ! $SUDO systemd-run --quiet --collect --unit="$PORT_TIMER_UNIT" \
+        --on-active="${PORT_TIMEOUT}s" --timer-property=AccuracySec=1s \
+        /bin/bash "$PORT_RUNNER" rollback; then
+        PORT_RUNNER=""
+        TRACKING_FILE=""
+        err "Recovery timer could not start; no SSH changes made / 无法启动恢复定时器，未修改 SSH。"
+        return 1
+    fi
+    info "Automatic rollback in $PORT_TIMEOUT seconds / $PORT_TIMEOUT 秒后将自动回滚，确认连接成功后取消。"
+}
+
+finish_port_transaction() {
+    local action="$1"
+    [[ -n "$PORT_RUNNER" ]] || return 0
+    if ! $SUDO /bin/bash "$PORT_RUNNER" "$action"; then
+        err "Recovery remains armed / 恢复定时器仍然保留。"
+        return 1
+    fi
+    # A timer racing with confirmation sees committed under the same lock.
+    $SUDO systemctl stop "${PORT_TIMER_UNIT}.timer" >/dev/null 2>&1 ||
+        warn "Could not stop timer; completed state prevents further changes / 未停止定时器，但完成状态会阻止重复修改。"
+    PORT_RUNNER=""
+    TRACKING_FILE=""
+}
+
+port_exit_cleanup() {
+    if [[ -n "$PORT_RUNNER" ]]; then
+        finish_port_transaction rollback || true
+    fi
+}
+
+change_port_flow() {
+    local yn choice fw
+    PORT_OLD="$(get_current_port)"
+    info "Current SSH port / 当前 SSH 端口: $PORT_OLD"
     while true; do
-        ask "Enter the new SSH port / 输入新的 SSH 端口 (1-65535):"
-        read -r new_port || { echo; return 1; }
-        validate_port "$new_port" || continue
-        if [[ "$new_port" == "$current_port" ]]; then
-            warn "New port is the same as current port / 新端口和当前端口相同，请换一个。"
+        ask "New SSH port / 新 SSH 端口 (1-65535):"
+        read -r PORT_NEW || return 1
+        validate_port "$PORT_NEW" || continue
+        [[ "$PORT_NEW" != "$PORT_OLD" ]] || { warn "Port unchanged / 端口未改变。"; continue; }
+        if port_in_use "$PORT_NEW"; then
+            warn "Port already in use; choose another / 端口已占用，请选择其他端口。"
             continue
-        fi
-        if (( new_port < 1024 )); then
-            ask "Port $new_port is a privileged port (<1024). Continue? / 这是特权端口，继续吗？[y/N]:"
-            read -r yn
-            [[ "$yn" =~ ^[Yy]$ ]] || continue
-        fi
-        if port_in_use "$new_port"; then
-            warn "Port $new_port appears to be in use by another service / 该端口可能已被其他服务占用。"
-            ask "Continue anyway? / 仍然继续吗？[y/N]:"
-            read -r yn
-            [[ "$yn" =~ ^[Yy]$ ]] || continue
         fi
         break
     done
 
-    # Reset per-flow change tracking so a rollback restores only this flow's
-    # modifications, not prior ones in the same session.
-    reset_modified_files
-
-    # Backup the systemd socket drop-in if it already exists, so rollback can
-    # restore it. socket_state lets rollback know whether to delete vs. restore.
-    local backup_socket_state="none"
+    $SUDO sshd -t -f "$SSHD_CONFIG" || return 1
+    scan_sshd_config Port "$PORT_NEW" || return 1
+    SOCKET_LISTEN_LINES=""
     if [[ -n "$SSH_SOCKET" ]]; then
-        local existing_dropin="/etc/systemd/system/${SSH_SOCKET}.d/override.conf"
-        if [[ -f "$existing_dropin" ]]; then
-            track_modified "$existing_dropin"
-            backup_socket_state="existed"
-        else
-            backup_socket_state="absent"
-        fi
+        SOCKET_LISTEN_LINES="$(socket_listen_lines "$PORT_NEW" | LC_ALL=C sort -u)" || return 1
+        [[ -n "$SOCKET_LISTEN_LINES" ]] || return 1
     fi
-
-    # Apply
-    info "Updating SSH config / 正在更新 SSH 配置 (Port $new_port) via $SSHD_TARGET..."
-    set_sshd_option "Port" "$new_port"
-
-    if [[ -n "$SSH_SOCKET" ]]; then
-        info "Writing systemd socket drop-in / 正在写入 systemd socket drop-in for $SSH_SOCKET..."
-        write_socket_dropin "$new_port"
-    fi
-
-    # Firewall
-    local fw
-    fw="$(detect_firewall)"
+    fw="$(detect_firewall)" || return 1
+    PORT_FIREWALL=""
     if [[ -n "$fw" ]]; then
-        info "Detected active firewall / 检测到启用的防火墙: $fw"
-        ask "Allow new port ${new_port}/tcp through ${fw}? / 放行新端口吗？[Y/n]:"
-        read -r yn
-        if [[ ! "$yn" =~ ^[Nn]$ ]]; then
-            firewall_open_port "$fw" "$new_port"
-        fi
-    else
-        warn "No local firewall (ufw/firewalld) detected as active / 未检测到启用的本机防火墙。"
-        warn "If your VPS uses a cloud security group, open port ${new_port}/tcp there before testing / 如果有云安全组，请先放行新端口。"
+        ask "Allow ${PORT_NEW}/tcp through $fw? / 在 $fw 放行新端口吗？[Y/n]:"
+        read -r yn || return 1
+        [[ "$yn" =~ ^[Nn]$ ]] || PORT_FIREWALL="$fw"
     fi
+    warn "Open ${PORT_NEW}/tcp in cloud security groups before continuing / 请先在云安全组放行新端口。"
+    ask "Apply with automatic rollback? / 应用修改并启用自动回滚？[y/N]:"
+    read -r yn || return 1
+    [[ "$yn" =~ ^[Yy]$ ]] || return 0
 
-    # Restart
-    info "Restarting SSH / 正在重启 SSH..."
-    if ! restart_ssh; then
-        err "SSH restart failed. Rolling back automatically / SSH 重启失败，正在自动回滚。"
-        rollback_port "$current_port" "$backup_socket_state" "$fw" "$new_port"
+    reset_modified_files
+    arm_port_rollback || return 1
+    if ! $SUDO /bin/bash "$PORT_RUNNER" apply; then
+        finish_port_transaction rollback
         return 1
     fi
-
-    ok "SSH is now configured to listen on port ${new_port} / SSH 已配置为监听端口 ${new_port}。"
-    sleep 1
-    if ! port_in_use "$new_port"; then
-        warn "Port ${new_port} does not appear in 'ss -tln' output / 未在监听端口列表中看到 ${new_port}，请留意。"
-    fi
-
-    # Test prompt with rollback
     cat <<EOF
 
-${BOLD}=== IMPORTANT / 重要：继续前请先测试 ===${NC}
-Keep THIS session open. From another terminal, run:
-请保持当前会话不要关闭，并在另一个终端运行：
+Keep this session open and test from another terminal / 保持当前会话，在另一个终端测试：
+    ssh -p $PORT_NEW $TARGET_USER@<this-server>
 
-    ssh -p ${new_port} ${TARGET_USER}@<this-server>
-
-Did the new connection succeed? / 新连接是否成功？
-  [1] Yes, keep the new port / 成功，保留新端口 (${new_port})
-  [2] No, roll back to old port / 失败，回滚到旧端口 (${current_port})
-  [3] Skip the test / 跳过测试（不推荐）
+[1] Connection succeeded: keep port / 新连接成功，保留端口
+[2] Restore previous port / 恢复旧端口
+No confirmation within $PORT_TIMEOUT seconds means rollback / 未在 $PORT_TIMEOUT 秒内确认将自动回滚。
 EOF
-    while true; do
-        ask "Choose / 请选择 [1/2/3]:"
-        read -r choice || { echo; warn "Input closed; keeping new port ${new_port}. Make sure you can reconnect / 输入已结束，保留新端口，请务必确认能重新连接！"; return 0; }
-        case "$choice" in
-            1) ok "Keeping new port ${new_port} / 保留新端口 ${new_port}。"
-               # Close old port in firewall (only if changed)
-               if [[ -n "$fw" ]]; then
-                   ask "Remove firewall rule for OLD port ${current_port}/tcp? / 删除旧端口防火墙规则吗？[y/N]:"
-                   read -r yn
-                   [[ "$yn" =~ ^[Yy]$ ]] && firewall_close_port "$fw" "$current_port"
-               fi
-               return 0 ;;
-            2) rollback_port "$current_port" "$backup_socket_state" "$fw" "$new_port"
-               return 0 ;;
-            3) warn "Skipping test. Make sure you can reconnect before logging out / 已跳过测试，退出前务必确认能重新连接！"
-               return 0 ;;
-            *) err "Invalid choice." ;;
-        esac
-    done
-}
-
-rollback_port() {
-    local old_port="$1" socket_state="$2" fw="$3" failed_port="$4"
-    warn "Rolling back to port ${old_port} / 正在回滚到端口 ${old_port}..."
-
-    # Restore every sshd config file we touched (main + drop-ins + any
-    # 00-ssh-setup.conf we created) and delete files we created from scratch.
-    restore_modified_files
-
-    # The socket drop-in is handled separately because the "absent" case
-    # means we created the file ourselves during this flow.
-    if [[ -n "$SSH_SOCKET" ]]; then
-        local dropin="/etc/systemd/system/${SSH_SOCKET}.d/override.conf"
-        if [[ "$socket_state" == "absent" ]]; then
-            $SUDO rm -f "$dropin"
-            $SUDO rmdir --ignore-fail-on-non-empty "/etc/systemd/system/${SSH_SOCKET}.d" 2>/dev/null || true
+    ask "Choose / 请选择 [1/2]:"
+    if ! read -r -t "$PORT_TIMEOUT" choice || [[ "$choice" != 1 ]]; then
+        finish_port_transaction rollback
+        return 1
+    fi
+    finish_port_transaction commit || return 1
+    ok "Confirmed SSH port $PORT_NEW / 已确认 SSH 新端口 $PORT_NEW。"
+    if [[ -n "$fw" ]]; then
+        ask "Remove old ${PORT_OLD}/tcp firewall rule? / 删除旧端口防火墙规则吗？[y/N]:"
+        read -r yn || return 0
+        if [[ "$yn" =~ ^[Yy]$ ]]; then
+            firewall_close_port "$fw" "$PORT_OLD" || return 1
         fi
-        $SUDO systemctl daemon-reload
-    fi
-
-    if [[ -n "$fw" && -n "$failed_port" ]]; then
-        firewall_close_port "$fw" "$failed_port"
-    fi
-
-    if restart_ssh; then
-        ok "Rolled back. SSH is again on port ${old_port} / 已回滚，SSH 重新使用端口 ${old_port}。"
-    else
-        err "Rollback restart failed. Manual intervention required."
-        err "Backups are in: $BACKUP_DIR"
     fi
 }
 
@@ -781,39 +1057,29 @@ rollback_port() {
 # Feature 2: password and key management
 # =====================================================================
 install_public_key() {
-    local pubkey="$1"
-    local ssh_dir="${TARGET_HOME}/.ssh"
-    local auth_file="${ssh_dir}/authorized_keys"
-
-    # Ensure ~/.ssh exists with correct perms.
-    # When running as root (SUDO=""), $SUDO -u ... would expand to "-u ...",
-    # so fall back to a plain mkdir and let the chown below fix ownership.
-    if [[ -n "$SUDO" ]]; then
-        $SUDO -u "$TARGET_USER" mkdir -p "$ssh_dir"
-    else
-        mkdir -p "$ssh_dir"
-    fi
-    $SUDO chmod 700 "$ssh_dir"
-    $SUDO chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$ssh_dir"
-
-    if [[ -f "$auth_file" ]] && $SUDO grep -qxF "$pubkey" "$auth_file"; then
-        warn "This exact key is already present in $auth_file. Nothing to do / 该公钥已存在，无需重复添加。"
+    local pubkey="$1" ssh_dir="${TARGET_HOME}/.ssh" auth_file="${TARGET_HOME}/.ssh/authorized_keys"
+    local tmp group
+    group="$(id -gn "$TARGET_USER")" || return 1
+    $SUDO mkdir -p "$ssh_dir" || return 1
+    $SUDO chmod 700 "$ssh_dir" || return 1
+    $SUDO chown "$TARGET_USER:$group" "$ssh_dir" || return 1
+    if $SUDO test -f "$auth_file" && $SUDO grep -qxF "$pubkey" "$auth_file"; then
+        ok "Public key already present / 公钥已存在。"
         return 0
     fi
-
-    local auth_existed=0
+    tmp="$(mktemp)" || return 1
     if $SUDO test -e "$auth_file"; then
-        auth_existed=1
-        track_modified "$auth_file"
+        if ! $SUDO cat "$auth_file" > "$tmp"; then rm -f "$tmp"; return 1; fi
     fi
-
-    printf '%s\n' "$pubkey" | $SUDO tee -a "$auth_file" >/dev/null
-    if (( auth_existed == 0 )); then
-        remember_created "$auth_file"
+    # A missing trailing newline in the old file must not join two key lines.
+    if ! printf '\n%s\n' "$pubkey" >> "$tmp" ||
+       ! prepare_file_change "$auth_file" ||
+       ! atomic_install "$tmp" "$auth_file" 0600 "$TARGET_USER" "$group"; then
+        rm -f "$tmp"
+        return 1
     fi
-    $SUDO chmod 600 "$auth_file"
-    $SUDO chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$auth_file"
-    ok "Public key appended to $auth_file / 公钥已添加到 $auth_file"
+    rm -f "$tmp"
+    ok "Public key installed / 公钥已写入: $auth_file"
 }
 
 add_key_flow() {
@@ -824,7 +1090,7 @@ Paste the public key (single line beginning with ssh-rsa / ssh-ed25519 / ecdsa-s
 Press ENTER when done / 粘贴后按回车：
 EOF
     local pubkey
-    read -r pubkey
+    read -r pubkey || return 1
 
     # Trim whitespace
     pubkey="$(echo "$pubkey" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
@@ -841,7 +1107,7 @@ EOF
     # Use ssh-keygen to validate format if available.
     if command -v ssh-keygen >/dev/null 2>&1; then
         local tmp
-        tmp="$(mktemp)"
+        tmp="$(mktemp)" || return 1
         printf '%s\n' "$pubkey" > "$tmp"
         if ! ssh-keygen -l -f "$tmp" >/dev/null 2>&1; then
             err "ssh-keygen rejected the key as malformed / ssh-keygen 认为该公钥格式错误。"
@@ -858,23 +1124,7 @@ enable_pubkey_auth_flow() {
     if [[ "${1:-}" != "--preserve-tracking" ]]; then
         reset_modified_files
     fi
-    set_sshd_option "PubkeyAuthentication" "yes"
-
-    if ! restart_ssh; then
-        err "SSH restart failed after enabling public-key login. Rolling back."
-        err "启用密钥登录后重启 SSH 失败，正在回滚。"
-        restore_modified_files
-        restart_ssh >/dev/null 2>&1 || err "Rollback restart failed. Manual intervention required."
-        return 1
-    fi
-
-    if ! verify_sshd_option PubkeyAuthentication yes; then
-        err "Public-key login is NOT effectively enabled. Rolling back."
-        err "密钥登录没有真正启用，正在回滚。"
-        restore_modified_files
-        restart_ssh >/dev/null 2>&1 || err "Rollback restart failed. Manual intervention required."
-        return 1
-    fi
+    apply_auth_options PubkeyAuthentication yes || return 1
     ok "Public-key authentication enabled and verified / 密钥登录已启用并验证。"
 }
 
@@ -890,7 +1140,7 @@ Before disabling password login, open a NEW terminal and verify that key login w
 EOF
     ask "Disable password login now? / 现在关闭密码登录吗？[y/N]:"
     local yn
-    read -r yn
+    read -r yn || return 1
     if [[ "$yn" =~ ^[Yy]$ ]]; then
         disable_password_auth_flow
     else
@@ -900,7 +1150,7 @@ EOF
 
 add_key_and_enable_flow() {
     reset_modified_files
-    add_key_flow || return 1
+    add_key_flow || { rollback_config_flow; return 1; }
     enable_pubkey_auth_flow --preserve-tracking || return 1
     ask_disable_password_after_key_setup
 }
@@ -929,18 +1179,18 @@ The PRIVATE key will be shown once so you can copy it to your local computer.
 
 EOF
     ask "Key comment / 密钥备注 [${key_comment}]:"
-    read -r input
+    read -r input || return 1
     [[ -n "$input" ]] && key_comment="$input"
 
     warn "The generated private key will have no passphrase unless you add one later locally."
     warn "生成的私钥默认没有密码保护；复制到本地后建议自行加密保存。"
     ask "Continue generating a key pair? / 继续生成密钥对吗？[y/N]:"
     local yn
-    read -r yn
+    read -r yn || return 1
     [[ "$yn" =~ ^[Yy]$ ]] || { info "Aborted by user / 用户已取消。"; return 0; }
 
-    tmp_dir="$(mktemp -d)"
-    chmod 700 "$tmp_dir"
+    tmp_dir="$(mktemp -d)" || return 1
+    chmod 700 "$tmp_dir" || { rm -rf "$tmp_dir"; return 1; }
     key_path="${tmp_dir}/id_ed25519"
 
     if ! ssh-keygen -q -t ed25519 -a 100 -N "" -C "$key_comment" -f "$key_path"; then
@@ -949,9 +1199,10 @@ EOF
         return 1
     fi
 
-    pubkey="$(cat "${key_path}.pub")"
+    pubkey="$(cat "${key_path}.pub")" || { rm -rf "$tmp_dir"; return 1; }
     reset_modified_files
     install_public_key "$pubkey" || {
+        rollback_config_flow
         rm -rf "$tmp_dir"
         return 1
     }
@@ -981,7 +1232,7 @@ $pubkey
 EOF
     ask "After saving the private key locally, type SAVED to delete the server copy / 本地保存私钥后，输入 SAVED 删除服务器临时副本:"
     local confirm
-    read -r confirm
+    read -r confirm || return 1
     if [[ "$confirm" == "SAVED" ]]; then
         rm -rf "$tmp_dir"
         ok "Temporary private key deleted from server / 服务器上的临时私钥已删除。"
@@ -1005,7 +1256,7 @@ The password is handled by the system passwd command; this script will not read 
 EOF
     ask "Continue? / 继续吗？[y/N]:"
     local yn
-    read -r yn
+    read -r yn || return 1
     [[ "$yn" =~ ^[Yy]$ ]] || { info "Aborted by user / 用户已取消。"; return 0; }
 
     if $SUDO passwd "$TARGET_USER"; then
@@ -1052,7 +1303,7 @@ then remove the selected public key from:
 EOF
     ask "Continue? / 继续吗？[y/N]:"
     local yn
-    read -r yn
+    read -r yn || return 1
     [[ "$yn" =~ ^[Yy]$ ]] || { info "Aborted by user / 用户已取消。"; return 0; }
 
     restore_password_auth || return 1
@@ -1063,14 +1314,14 @@ ${BOLD}=== IMPORTANT / 重要：删除公钥前请先测试密码登录 ===${NC}
 Keep THIS session open. From another terminal, run:
 请保持当前会话不要关闭，并在另一个终端运行：
 
-    ssh ${TARGET_USER}@<this-server>
+    ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password -o ControlPath=none ${TARGET_USER}@<this-server>
 
 If you changed the SSH port, add -p <port>.
 如果你改过 SSH 端口，请加上 -p <端口>。
 
 EOF
     ask "Did password login succeed? / 密码登录是否成功？[y/N]:"
-    read -r yn
+    read -r yn || return 1
     if [[ ! "$yn" =~ ^[Yy]$ ]]; then
         warn "Password login was not confirmed. Keeping keys unchanged."
         warn "未确认密码登录成功，公钥保持不变。"
@@ -1093,7 +1344,7 @@ $keys
 EOF
     ask "Enter the line number to remove / 输入要删除的行号:"
     local line_no
-    read -r line_no
+    read -r line_no || return 1
     if ! [[ "$line_no" =~ ^[0-9]+$ ]]; then
         err "Line number must be an integer / 行号必须是整数。"
         return 1
@@ -1106,17 +1357,23 @@ EOF
 
     ask "Type DELETE to remove line ${line_no} / 输入 DELETE 删除第 ${line_no} 行:"
     local confirm
-    read -r confirm
+    read -r confirm || return 1
     if [[ "$confirm" != "DELETE" ]]; then
         info "Aborted by user / 用户已取消。"
         return 0
     fi
 
-    backup_file "$auth_file" >/dev/null
-    local tmp
-    tmp="$(mktemp)"
-    $SUDO awk -v n="$line_no" 'NR != n {print}' "$auth_file" > "$tmp"
-    $SUDO install -m 0600 -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER")" "$tmp" "$auth_file"
+    reset_modified_files
+    local tmp group
+    tmp="$(mktemp)" || return 1
+    group="$(id -gn "$TARGET_USER")" || { rm -f "$tmp"; return 1; }
+    if ! $SUDO awk -v n="$line_no" 'NR != n {print}' "$auth_file" > "$tmp" ||
+       ! track_modified "$auth_file" ||
+       ! atomic_install "$tmp" "$auth_file" 0600 "$TARGET_USER" "$group"; then
+        rm -f "$tmp"
+        rollback_config_flow
+        return 1
+    fi
     rm -f "$tmp"
     ok "Removed public key line ${line_no}. Password login remains enabled."
     ok "已删除第 ${line_no} 行公钥，密码登录保持启用。"
@@ -1130,32 +1387,30 @@ disable_password_auth_flow() {
 
     info "Pre-flight checks before disabling password authentication / 关闭密码登录前检查..."
 
-    # 1. authorized_keys must exist and contain at least one key
-    if [[ ! -s "$auth_file" ]] && ! $SUDO test -s "$auth_file"; then
-        err "No authorized_keys found for $TARGET_USER ($auth_file)."
-        err "未找到 ${TARGET_USER} 的 authorized_keys。请先添加密钥，拒绝关闭密码登录。"
+    # Validate real public keys, not just text beginning with "ssh-".
+    local fingerprints key_count config authorized_paths path key_file_used=0
+    fingerprints="$($SUDO ssh-keygen -l -f "$auth_file" 2>/dev/null)" || {
+        err "No valid authorized key / 没有有效的授权公钥: $auth_file"
+        return 1
+    }
+    key_count="$(printf '%s\n' "$fingerprints" | wc -l | tr -d ' ')"
+    (( key_count > 0 )) || return 1
+    config="$(effective_sshd_config connection)" || return 1
+    authorized_paths="$(awk '$1=="authorizedkeysfile" {$1=""; print}' <<< "$config")"
+    for path in $authorized_paths; do
+        case "$path" in
+            .ssh/authorized_keys|"$auth_file"|'%h/.ssh/authorized_keys') key_file_used=1 ;;
+        esac
+    done
+    if (( ! key_file_used )); then
+        err "sshd uses a different AuthorizedKeysFile / sshd 使用了不同的公钥文件，拒绝关闭密码登录。"
         return 1
     fi
-    # Note: grep -c prints "0" AND exits non-zero on no match, so an
-    # "|| echo 0" fallback here would yield "0\n0" and break the (( )) test.
-    local key_count
-    key_count="$($SUDO grep -cE '^[[:space:]]*(ssh-|ecdsa-|sk-)' "$auth_file" 2>/dev/null)"
-    [[ "$key_count" =~ ^[0-9]+$ ]] || key_count=0
-    if (( key_count < 1 )); then
-        err "$auth_file has no recognizable public keys. Aborting / 没有可识别的公钥，已取消。"
-        return 1
-    fi
-    ok "Found $key_count key(s) in $auth_file / 在 $auth_file 中找到 $key_count 个公钥。"
-
-    # 2. Effective sshd config must allow pubkey auth
-    local pubkey_auth
-    pubkey_auth="$($SUDO sshd -T 2>/dev/null | awk '$1=="pubkeyauthentication"{print $2; exit}')"
-    if [[ "$pubkey_auth" != "yes" ]]; then
-        err "Effective PubkeyAuthentication is '$pubkey_auth' (need 'yes'). Aborting."
-        err "当前有效 PubkeyAuthentication 为 '$pubkey_auth'，需要为 'yes'，已取消。"
-        return 1
-    fi
-    ok "PubkeyAuthentication is enabled / 密钥登录已启用。"
+    verify_sshd_option PubkeyAuthentication yes || return 1
+    # Refuse all conflicting Match exceptions, including other users/addresses.
+    scan_sshd_config PasswordAuthentication no &&
+        scan_sshd_config KbdInteractiveAuthentication no || return 1
+    ok "Found $key_count valid key(s); pubkey auth enabled / 已找到有效公钥并启用密钥认证。"
 
     # 3. Confirm
     cat <<EOF
@@ -1169,41 +1424,16 @@ Make sure you have already verified that your key works.
 
 EOF
     ask "Type 'YES' (uppercase) to proceed / 输入大写 YES 继续:"
-    read -r confirm
+    read -r confirm || return 1
     if [[ "$confirm" != "YES" ]]; then
         info "Aborted by user / 用户已取消。"
         return 0
     fi
 
     reset_modified_files
-    set_sshd_option "PasswordAuthentication" "no"
-    set_sshd_option "ChallengeResponseAuthentication" "no"
-    set_sshd_option "KbdInteractiveAuthentication" "no"
-    set_sshd_option "UsePAM" "yes"  # leave PAM on; the auth method flags above gate it
+    apply_auth_options PasswordAuthentication no KbdInteractiveAuthentication no UsePAM yes || return 1
+    ok "Password authentication disabled and verified / 密码登录已关闭并验证。"
 
-    if ! restart_ssh; then
-        err "SSH restart failed after disabling password auth. Rolling back."
-        err "关闭密码登录后重启 SSH 失败，正在回滚。"
-        restore_modified_files
-        restart_ssh && ok "Rolled back; password auth state unchanged." \
-            || err "Rollback restart also failed. Backups are in: $BACKUP_DIR"
-        return 1
-    fi
-
-    # Verify the change actually took effect — sshd_config first-match-wins
-    # means a drop-in we missed could still be saying 'yes'.
-    local mismatch=0
-    verify_sshd_option PasswordAuthentication no || mismatch=1
-    verify_sshd_option KbdInteractiveAuthentication no || mismatch=1
-    if (( mismatch )); then
-        err "Password authentication is NOT effectively disabled. Rolling back."
-        err "密码登录没有真正关闭，正在回滚。"
-        restore_modified_files
-        restart_ssh && warn "Rolled back. Investigate the conflicting file and try again." \
-            || err "Rollback restart failed. Backups are in: $BACKUP_DIR"
-        return 1
-    fi
-    ok "Password authentication disabled and verified. SSH restarted / 密码登录已关闭并验证，SSH 已重启。"
 }
 
 # =====================================================================
@@ -1249,7 +1479,7 @@ EOF
         local c
         read -r c || { echo; info "Bye / 再见。"; exit 0; }
         case "$c" in
-            1) change_port_flow ;;
+            1) change_port_flow; [[ -z "$PORT_RUNNER" ]] || exit 1 ;;
             2) password_key_menu ;;
             q|Q) info "Bye / 再见。"; exit 0 ;;
             *) err "Invalid choice / 无效选项。" ;;
@@ -1259,6 +1489,7 @@ EOF
 
 # ---------- entry ----------
 main() {
+    init_privileges || exit 1
     local stdin_ok=1
     ensure_tty_stdin || stdin_ok=0
 
@@ -1279,8 +1510,14 @@ main() {
     detect_ssh_units
     detect_sshd_target
     detect_target_user
-    init_backup_dir
+    init_backup_dir || exit 1
+    trap port_exit_cleanup EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     main_menu
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]:-}" == "$0" || -z "${BASH_SOURCE[0]:-}" ]]; then
+    main "$@"
+fi
