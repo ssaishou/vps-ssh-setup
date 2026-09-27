@@ -358,6 +358,21 @@ INPUT
 """, expected=1)
         self.assertIn("DECISION=rollback", output)
 
+    def test_recovery_helper_carries_connection_context(self):
+        self.run_shell(r'''
+PORT_NEW=2222 PORT_OLD=22 PORT_FIREWALL=""
+systemd-run() { return 0; }
+flock() { return 0; }
+arm_port_rollback || exit
+# Load the emitted helper in a fresh shell without running its final action.
+# This exercises serialization without requiring a real systemd or root.
+sed '$d' "$PORT_RUNNER" > "$TEST_ROOT/helper-library.sh" || exit
+env -i PATH=/usr/bin:/bin:/usr/sbin /bin/bash -c '
+    source "$1"
+    verify_sshd_option Port 22
+' _ "$TEST_ROOT/helper-library.sh"
+''')
+
     @unittest.skipUnless(LINUX_ROOT, "serialized recovery helper requires Linux root")
     def test_guard_serialization_and_expired_confirmation(self):
         self.run_shell("""

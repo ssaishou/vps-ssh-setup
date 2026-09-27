@@ -934,7 +934,7 @@ arm_port_rollback() {
             SSHD_DROPIN_DIR_CFG SSHD_INCLUDE_BASE SSHD_CONFIG_FILES SYSTEMD_CONFIG_DIR \
             SCAN_IN_MATCH SCAN_KEY SCAN_VALUE SOCKET_LISTEN_LINES \
             MODIFIED_FILES CREATED_FILES FIREWALL_ADDED FIREWALL_ZONE \
-            PORT_NEW PORT_OLD PORT_FIREWALL PORT_RUNNER TRACKING_FILE
+            PORT_NEW PORT_OLD PORT_FIREWALL PORT_RUNNER TRACKING_FILE TARGET_USER
         printf 'SUDO=""\nSSH_CONNECTION=%q\n' "${SSH_CONNECTION:-}"
         for function_name in info ok warn err atomic_install persist_tracking \
             current_flow_dir backup_file is_created track_modified remember_created \
